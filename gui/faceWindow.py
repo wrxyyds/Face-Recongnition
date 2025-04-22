@@ -35,7 +35,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.open_flag = False
-        self.fream = None
+        self.frame = None
         self.image = None
         self.faces = None
         self.features = None
