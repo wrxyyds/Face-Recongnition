@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torch.optim.lr_scheduler import StepLR
 from PIL import Image
 from face.facenet.model import Resnet34Triplet
 
@@ -66,11 +67,9 @@ def generate_triplets_from_batch(labels):
     return triplets
 
 
-
 # 迁移训练函数
-# === 修复后的训练函数 ===
-def transfer_train(model, dataloader, criterion, optimizer, num_epochs=10):
-    device = torch.device("cpu")
+def transfer_train(model, dataloader, criterion, optimizer, scheduler, num_epochs=10):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
 
@@ -85,7 +84,7 @@ def transfer_train(model, dataloader, criterion, optimizer, num_epochs=10):
             triplets = generate_triplets_from_batch(batch_labels)
 
             for anchor_idx, positive_idx, negative_idx in triplets:
-                anchor_img = batch_images[anchor_idx:anchor_idx+1]     # shape: [1, 3, H, W]
+                anchor_img = batch_images[anchor_idx:anchor_idx+1]
                 positive_img = batch_images[positive_idx:positive_idx+1]
                 negative_img = batch_images[negative_idx:negative_idx+1]
 
@@ -108,15 +107,18 @@ def transfer_train(model, dataloader, criterion, optimizer, num_epochs=10):
             epoch_loss = 0.0
 
         print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}')
+        scheduler.step()
 
     return model
 
 
 # 主函数
 def train():
-    # 数据预处理
+    # 增强后的数据预处理
     transform = transforms.Compose([
         transforms.Resize((140, 140)),
+        # transforms.RandomHorizontalFlip(),  # 随机水平翻转
+        # transforms.RandomRotation(10),  # 随机旋转
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.6071, 0.4609, 0.3944],
@@ -125,23 +127,24 @@ def train():
     ])
 
     # 加载自定义数据集
-    dataset = CustomFaceDataset(root_dir='./images/train', transform=transform)
+    dataset = CustomFaceDataset(root_dir='../images/train', transform=transform)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 初始化预训练模型
-    checkpoint = torch.load('./face/facenet/weights/model_resnet34_triplet.pt', map_location='cpu')
+    checkpoint = torch.load('../face/facenet/weights/model_resnet34_triplet.pt', map_location='cpu')
     model = Resnet34Triplet(embedding_dimension=checkpoint['embedding_dimension'])
     model.load_state_dict(checkpoint['model_state_dict'])
 
     # 定义损失函数和优化器
-    criterion = nn.TripletMarginLoss(margin=1.0)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.TripletMarginLoss(margin=0.5)
+    optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
 
     # 迁移训练模型
-    trained_model = transfer_train(model, dataloader, criterion, optimizer, num_epochs=10)
+    trained_model = transfer_train(model, dataloader, criterion, optimizer, scheduler)
 
     # 保存迁移训练后的模型
-    torch.save(trained_model.state_dict(), 'face/facenet/weights/transferred_facenet_model.pt')
+    torch.save(trained_model.state_dict(), '../face/facenet/weights/transferred_facenet_model.pt')
 
 if __name__ == "__main__":
     train()

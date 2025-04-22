@@ -6,7 +6,7 @@ import numpy as np
 import os
 
 class FaceExtractor:
-    def __init__(self, device='cpu'):
+    def __init__(self, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
         self.device = device
         if os.path.exists('face/facenet/weights/transferred_facenet_model.pt'):
             self.model = Resnet34Triplet(embedding_dimension=512)
