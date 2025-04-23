@@ -8,6 +8,7 @@ from torch.optim.lr_scheduler import StepLR
 from PIL import Image
 from face.facenet.model import Resnet34Triplet
 
+
 # 自定义数据集类
 class CustomFaceDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -60,60 +61,68 @@ def generate_triplets_from_batch(labels):
         negative_label = anchor_label
         while negative_label == anchor_label:
             negative_label = labels[torch.randint(len(labels), (1,))].item()
-        negative_idx = label_to_indices[negative_label][torch.randint(len(label_to_indices[negative_label]), (1,)).item()]
+        negative_idx = label_to_indices[negative_label][
+            torch.randint(len(label_to_indices[negative_label]), (1,)).item()]
 
         triplets.append((anchor_idx, positive_idx, negative_idx))
 
     return triplets
 
 
+# 一次epoch的训练步骤
+def train_step(model, dataloader, criterion, optimizer, epoch, num_epochs):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.train()
+    running_loss = 0.0
+    total_triplets = 0
+
+    for batch_images, batch_labels in dataloader:
+        batch_images = batch_images.to(device)
+        batch_labels = batch_labels.to(device)
+
+        triplets = generate_triplets_from_batch(batch_labels)
+
+        for anchor_idx, positive_idx, negative_idx in triplets:
+            anchor_img = batch_images[anchor_idx:anchor_idx + 1]
+            positive_img = batch_images[positive_idx:positive_idx + 1]
+            negative_img = batch_images[negative_idx:negative_idx + 1]
+
+            optimizer.zero_grad()
+
+            anchor_embedding = model(anchor_img)
+            positive_embedding = model(positive_img)
+            negative_embedding = model(negative_img)
+
+            loss = criterion(anchor_embedding, positive_embedding, negative_embedding)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            total_triplets += 1
+
+    if total_triplets > 0:
+        epoch_loss = running_loss / total_triplets
+    else:
+        epoch_loss = 0.0
+
+    print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}')
+    return epoch_loss
+
+
 # 迁移训练函数
 def transfer_train(model, dataloader, criterion, optimizer, scheduler, num_epochs=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model.train()
 
     for epoch in range(num_epochs):
-        running_loss = 0.0
-        total_triplets = 0
-
-        for batch_images, batch_labels in dataloader:
-            batch_images = batch_images.to(device)
-            batch_labels = batch_labels.to(device)
-
-            triplets = generate_triplets_from_batch(batch_labels)
-
-            for anchor_idx, positive_idx, negative_idx in triplets:
-                anchor_img = batch_images[anchor_idx:anchor_idx+1]
-                positive_img = batch_images[positive_idx:positive_idx+1]
-                negative_img = batch_images[negative_idx:negative_idx+1]
-
-                optimizer.zero_grad()
-
-                anchor_embedding = model(anchor_img)
-                positive_embedding = model(positive_img)
-                negative_embedding = model(negative_img)
-
-                loss = criterion(anchor_embedding, positive_embedding, negative_embedding)
-                loss.backward()
-                optimizer.step()
-
-                running_loss += loss.item()
-                total_triplets += 1
-
-        if total_triplets > 0:
-            epoch_loss = running_loss / total_triplets
-        else:
-            epoch_loss = 0.0
-
-        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}')
+        train_step(model, dataloader, criterion, optimizer, epoch, num_epochs)
         scheduler.step()
 
     return model
 
 
 # 主函数
-def train():
+def train(img_path, model_path, new_model_path):
     # 增强后的数据预处理
     transform = transforms.Compose([
         transforms.Resize((140, 140)),
@@ -127,13 +136,19 @@ def train():
     ])
 
     # 加载自定义数据集
-    dataset = CustomFaceDataset(root_dir='../images/train', transform=transform)
+    dataset = CustomFaceDataset(root_dir=img_path, transform=transform)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 初始化预训练模型
-    checkpoint = torch.load('../face/facenet/weights/model_resnet34_triplet.pt', map_location='cpu')
-    model = Resnet34Triplet(embedding_dimension=checkpoint['embedding_dimension'])
-    model.load_state_dict(checkpoint['model_state_dict'])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if os.path.exists('face/facenet/weights/transferred_facenet_model.pt'):
+        model = Resnet34Triplet(embedding_dimension=512)
+        checkpoint = torch.load(model_path)
+        model.load_state_dict(checkpoint)
+    else:
+        checkpoint = torch.load(model_path, map_location=device)
+        model = Resnet34Triplet(embedding_dimension=checkpoint['embedding_dimension'])
+        model.load_state_dict(checkpoint['model_state_dict'])
 
     # 定义损失函数和优化器
     criterion = nn.TripletMarginLoss(margin=0.5)
@@ -144,7 +159,13 @@ def train():
     trained_model = transfer_train(model, dataloader, criterion, optimizer, scheduler)
 
     # 保存迁移训练后的模型
-    torch.save(trained_model.state_dict(), '../face/facenet/weights/transferred_facenet_model.pt')
+    torch.save(trained_model.state_dict(), new_model_path)
+
 
 if __name__ == "__main__":
-    train()
+    if os.path.exists('face/facenet/weights/transferred_facenet_model.pt'):
+        train('./images/train/', './face/facenet/weights/transferred_facenet_model.pt', './face/facenet/weights'
+                                                                                        '/transferred_facenet_model.pt')
+    else:
+        train('./images/train/', './face/facenet/weights/model_resnet34_triplet.pt', './face/facenet/weights'
+                                                                                     '/transferred_facenet_model.pt')
