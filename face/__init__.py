@@ -29,7 +29,7 @@ class FaceSystem:
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             face = image[y1: y2, x1: x2, :]
             face = cv2.cvtColor(face, cv2.COLOR_RGB2BGR)
-            path = os.path.join(save_path, "face_" + str(i) + ".jpg")
+            path = save_path + "face_" + str(i) + ".jpg"
             print('[save] ', path)
             cv2.imwrite(path, face)
 
