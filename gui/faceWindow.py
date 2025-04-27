@@ -1,4 +1,7 @@
 import threading
+
+import numpy as np
+
 import train
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt
@@ -77,10 +80,12 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 for line in f.readlines():
                     self.names.append(line.strip())
             self.features = np.array(self.features)
+            self.features = np.squeeze(self.features)
         else:
             self.features = np.empty((0, 0))
 
     def calculate_distance(self, feature):
+        # self.features的形状是(num, batch_size = 1, 512)
         distance = np.sqrt(np.sum(np.square(self.features - feature), axis=1))
         min_index = np.argmin(distance)
         return self.names[min_index], distance[min_index]
@@ -123,6 +128,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
         reply1 = QtWidgets.QMessageBox.question(self, '提示', '是否要使用该图像进行特征提取', QMessageBox.No | QMessageBox.Yes)
         if reply1 == QMessageBox.StandardButton.Yes:
             feature = self.fs.get_face_feature(Image.fromarray(face1))
+            # feature的形状是(1, 512)
             if self.features.shape[0] != 0:
                 name, min_dis = self.calculate_distance(feature)
                 print(min_dis)
@@ -263,6 +269,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
 
         # 保存图片
         cv2.imwrite(path, image)
+
 
 
 if __name__ == '__main__':
