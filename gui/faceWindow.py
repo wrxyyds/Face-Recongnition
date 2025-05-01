@@ -11,6 +11,10 @@ from qt_material import apply_stylesheet, QtStyleTools, QUiLoader
 from face import *
 from PIL import Image
 
+import pymysql
+from datetime import datetime
+
+
 class QShowImage(QWidget):
     def __init__(self):
         super(QShowImage, self).__init__()
@@ -26,6 +30,48 @@ class QShowImage(QWidget):
         self.label.setPixmap(pixmap)
 
 
+class RegistrationDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("注册信息")
+
+        # 创建输入框
+        self.student_id_input = QLineEdit(self)
+        self.name_input = QLineEdit(self)
+        self.identity_input = QLineEdit(self)
+
+        # 创建标签
+        student_id_label = QLabel("学号:", self)
+        name_label = QLabel("姓名:", self)
+        identity_label = QLabel("身份:", self)
+
+        # 创建按钮
+        ok_button = QPushButton("确定", self)
+        cancel_button = QPushButton("取消", self)
+
+        # 布局
+        layout = QGridLayout()
+        layout.addWidget(student_id_label, 0, 0)
+        layout.addWidget(self.student_id_input, 0, 1)
+        layout.addWidget(name_label, 1, 0)
+        layout.addWidget(self.name_input, 1, 1)
+        layout.addWidget(identity_label, 2, 0)
+        layout.addWidget(self.identity_input, 2, 1)
+        layout.addWidget(ok_button, 3, 0)
+        layout.addWidget(cancel_button, 3, 1)
+
+        self.setLayout(layout)
+
+        # 连接按钮信号
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+
+    def get_inputs(self):
+        student_id = self.student_id_input.text()
+        name = self.name_input.text()
+        identity = self.identity_input.text()
+        return student_id, name, identity
+
 
 class FaceWindow(QMainWindow, QtStyleTools):
     def __init__(self, parent=None):
@@ -37,7 +83,9 @@ class FaceWindow(QMainWindow, QtStyleTools):
         self.faces = None
         self.another_faces = None
         self.features = None
+        self.register_ids = None
         self.names = None
+        self.identities = None
         self.lock = threading.Lock()  # 添加线程锁
 
         # load widegts form ui file
@@ -57,28 +105,53 @@ class FaceWindow(QMainWindow, QtStyleTools):
         self.load_feature()
         self.setVisible(False)
 
-    def save_feature(self, feature, name):
+        # 建立数据库连接
+        self.connection = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='88888888',
+            database='face_reconginition',
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        self.cursor = self.connection.cursor()
+
+
+    def save_feature(self, feature, register_id, name, identity):
         # save np feature to file
         id = len(os.listdir('../datas/faces'))
         np.save(f'../datas/faces/{id}.npy', feature)
-        with open('../datas/names.txt', 'a') as f:
-            f.write(f'{name}\n')
+        with open('../datas/names.txt', 'a', encoding='utf-8') as f:
+            f.write(str(register_id))
+            f.write(',')
+            f.write(name)
+            f.write(',')
+            f.write(identity)
+            f.write('\n')
         if self.features.shape[0] != 0:
             self.features = np.concatenate((self.features, feature), axis=0)
         else:
             self.features = feature.reshape(1, -1)
+        self.register_ids.append(register_id)
         self.names.append(name)
+        self.identities.append(identity)
 
     def load_feature(self):
         self.features = []
+        self.register_ids = []
         self.names = []
+        self.identities = []
         feature_files = os.listdir('../datas/faces')
         if len(feature_files) > 0:
             for file in feature_files:
                 self.features.append(np.load(f'../datas/faces/{file}'))
             with open('../datas/names.txt', 'r') as f:
                 for line in f.readlines():
-                    self.names.append(line.strip())
+                    line = line.strip()
+                    register_id, name, identity = line.split(',')
+                    self.register_ids.append(register_id[1:])
+                    self.names.append(name)
+                    self.identities.append(identity)
             self.features = np.array(self.features)
             self.features = np.squeeze(self.features)
         else:
@@ -88,7 +161,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
         # self.features的形状是(num, batch_size = 1, 512)
         distance = np.sqrt(np.sum(np.square(self.features - feature), axis=1))
         min_index = np.argmin(distance)
-        return self.names[min_index], distance[min_index]
+        return min_index, distance[min_index]
 
     def face_recognition(self):
         with self.lock:  # 使用线程锁
@@ -102,10 +175,31 @@ class FaceWindow(QMainWindow, QtStyleTools):
                                        #QImage.Format_RGB888))
         #self.face_img.setVisible(True)
         feature = self.fs.get_face_feature(Image.fromarray(face))
-        name, min_dis = self.calculate_distance(feature)
+        min_index, min_dis = self.calculate_distance(feature)
         print('min_dis', min_dis)
         if min_dis < 0.5:
-            QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{name}')
+            now = datetime.now()
+            punch_time = now.strftime('%Y-%m-%d %H:%M:%S')
+            with self.cursor as cursor:
+                # 插入数据的 SQL 语句
+                print(self.names[min_index])
+                print(self.register_ids[min_index])
+                print(self.identities[min_index])
+                if self.identities[min_index] == 'student':
+                    sql = "INSERT INTO student_attendance (student_id, student_name, punch_time) VALUES (%s, %s, %s)"
+                    values = (str(self.register_ids[min_index]), str(self.names[min_index]), punch_time)
+                else:
+                    sql = "INSERT INTO teacher_attendance (teacher_id, teacher_name, punch_time) VALUES (%s, %s, %s)"
+                    values = (str(self.register_ids[min_index]), str(self.names[min_index]), punch_time)
+
+                # 执行插入操作
+                cursor.execute(sql, values)
+
+            # 提交事务
+            self.connection.commit()
+            print("数据插入成功！")
+
+            QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{self.register_ids[min_index]}')
         else:
             QtWidgets.QMessageBox.information(self, '提示', '人脸不在数据库中')
         #self.face_img.setVisible(False)
@@ -121,44 +215,41 @@ class FaceWindow(QMainWindow, QtStyleTools):
         face1 = np.ascontiguousarray(
             self.frame[self.faces[0][1]:self.faces[0][3], self.faces[0][0]:self.faces[0][2]])
         face2 = np.ascontiguousarray(
-            self.another_frame[self.another_faces[0][1]:self.another_faces[0][3], self.another_faces[0][0]:self.another_faces[0][2]])
-        #self.face_img.set_image(QImage(face.data, face.shape[1], face.shape[0], face.shape[1] * 3,
-                                       #QImage.Format_RGB888))
-        #self.face_img.setVisible(True)
-        reply1 = QtWidgets.QMessageBox.question(self, '提示', '是否要使用该图像进行特征提取', QMessageBox.No | QMessageBox.Yes)
+            self.another_frame[self.another_faces[0][1]:self.another_faces[0][3],
+            self.another_faces[0][0]:self.another_faces[0][2]])
+        reply1 = QtWidgets.QMessageBox.question(self, '提示', '是否要使用该图像进行特征提取',
+                                                QMessageBox.No | QMessageBox.Yes)
         if reply1 == QMessageBox.StandardButton.Yes:
             feature = self.fs.get_face_feature(Image.fromarray(face1))
-            # feature的形状是(1, 512)
             if self.features.shape[0] != 0:
-                name, min_dis = self.calculate_distance(feature)
+                min_index, min_dis = self.calculate_distance(feature)
                 print(min_dis)
                 if min_dis < 0.5:
                     QtWidgets.QMessageBox.warning(self, '提示', f'该人脸已经注册过!')
                 else:
-                    name, ok = QInputDialog.getText(self, '输入', '请输入唯一代号', QLineEdit.Normal, '唯一代号')
-                    if ok:
-                        self.save_image(face1, '../images/train/' + str(name) + '/' + 'face_0.jpg')
-                        self.save_image(face2, '../images/train/' + str(name) + '/' + 'face_1.jpg')
-                        train.train(str(name))
+                    dialog = RegistrationDialog(self)
+                    if dialog.exec_() == QDialog.Accepted:
+                        register_id, name, identity = dialog.get_inputs()
+                        if name:
+                            self.save_image(face1, '../images/train/' + str(register_id) + '/' + 'face_0.jpg')
+                            self.save_image(face2, '../images/train/' + str(register_id) + '/' + 'face_1.jpg')
+                            train.train(str(register_id))
+                            self.fs = FaceSystem()
+                            feature = self.fs.get_face_feature(Image.fromarray(face1))
+                            self.save_feature(feature, str(register_id), str(name), str(identity))
+                            QtWidgets.QMessageBox.information(self, '提示', f'人脸注册成功！')
+            else:
+                dialog = RegistrationDialog(self)
+                if dialog.exec_() == QDialog.Accepted:
+                    register_id, name, identity = dialog.get_inputs()
+                    if name:
+                        self.save_image(face1, '../images/train/' + str(register_id) + '/' + 'face_0.jpg')
+                        self.save_image(face2, '../images/train/' + str(register_id) + '/' + 'face_1.jpg')
+                        train.train(str(register_id))
                         self.fs = FaceSystem()
                         feature = self.fs.get_face_feature(Image.fromarray(face1))
-                        self.save_feature(feature, str(name))
+                        self.save_feature(feature, str(register_id), str(name), str(identity))
                         QtWidgets.QMessageBox.information(self, '提示', f'人脸注册成功！')
-            else:
-                name, ok = QInputDialog.getText(self, '输入', '请输入唯一代号', QLineEdit.Normal, '唯一代号')
-                if ok:
-                    self.save_image(face1, '../images/train/' + str(name) + '/' + 'face_0.jpg')
-                    self.save_image(face2, '../images/train/' + str(name) + '/' + 'face_1.jpg')
-                    train.train(str(name))
-                    self.fs = FaceSystem()
-                    feature = self.fs.get_face_feature(Image.fromarray(face1))
-                    self.save_feature(feature, str(name))
-                    QtWidgets.QMessageBox.information(self, '提示', f'人脸注册成功！')
-        #self.face_img.setVisible(False)
-
-        # name, ok = QInputDialog.getText(self, '输入', '请输入姓名')
-        # if ok:
-        #     face_img.close()
 
     def video_open_close(self):
         if self.open_flag:
@@ -251,7 +342,24 @@ class FaceWindow(QMainWindow, QtStyleTools):
                     self.main.video.setPixmap(QPixmap.fromImage(img))
                 cv2.waitKey(int(1000 / 30))
 
+    def closeEvent(self, event):
+        # Set a flag to stop the display thread
+        self.open_flag = False
 
+
+        # Wait for the thread to finish
+        if self.th.is_alive():
+            self.th.join()
+
+        # Release camera resource
+        if self.cap.isOpened():
+            self.cap.release()
+
+        # Accept the close event
+        super().closeEvent(event)
+
+        # Ensure the application quits
+        QApplication.quit()
 
     def save_image(self, image, path):
         """

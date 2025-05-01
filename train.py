@@ -330,4 +330,4 @@ def train(cls):
 
 
 if __name__ == "__main__":
-    train('wrx')
+    train('2107090712')
