@@ -291,7 +291,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
                     faces[:, 1] = faces[:, 1] * (h - 20)
                     faces[:, 2] = faces[:, 2] * (w - 20)
                     faces[:, 3] = faces[:, 3] * (h - 20)
-                    faces = faces.astype(np.int)
+                    faces = faces.astype(int)
                     # 将人脸坐标画出来
                     frame = draw_bboxes(frame, faces)
                     with self.lock:  # 使用线程锁
@@ -325,7 +325,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
                     faces[:, 1] = faces[:, 1] * (h - 20)
                     faces[:, 2] = faces[:, 2] * (w - 20)
                     faces[:, 3] = faces[:, 3] * (h - 20)
-                    faces = faces.astype(np.int)
+                    faces = faces.astype(int)
                     # 将人脸坐标画出来
                     frame = draw_bboxes(frame, faces)
                     with self.lock:  # 使用线程锁
@@ -383,4 +383,4 @@ class FaceWindow(QMainWindow, QtStyleTools):
 if __name__ == '__main__':
     app = QApplication([])
     window = FaceWindow()
-    app.exec_()
+    app.exec()
