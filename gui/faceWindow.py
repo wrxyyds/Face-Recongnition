@@ -2,7 +2,7 @@ import threading
 import numpy as np
 import train
 from PySide6 import QtWidgets
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent
 from PySide6.QtWidgets import *
 from PySide6.QtGui import QImage, QPixmap
 from qt_material import apply_stylesheet, QtStyleTools, QUiLoader
@@ -85,22 +85,29 @@ class FaceWindow(QMainWindow, QtStyleTools):
         self.identities = None
         self.lock = threading.Lock()  # 添加线程锁
 
-        # load widegts form ui file
+        # load widgets form ui file
         self.main = QUiLoader().load('ui.ui', self)
         self.main.button1.clicked.connect(self.video_open_close)
         self.main.button2.clicked.connect(self.register)
         self.main.button3.clicked.connect(self.face_recognition)
         apply_stylesheet(self.main, theme='light_blue.xml')
 
+        # 安装事件过滤器以捕获关闭事件
+        self.main.installEventFilter(self)
+
+        # 连接应用程序的aboutToQuit信号到自定义清理函数
+        QApplication.instance().aboutToQuit.connect(self.cleanup_resources)
+
         self.cap = cv2.VideoCapture(0)
         self.fs = FaceSystem()
         self.face_img = QShowImage()
-        self.show()
+
+        # 只显示main窗口
         self.main.show()
+
         self.th = threading.Thread(target=self.display)
         self.th.start()
         self.load_feature()
-        self.setVisible(False)
 
         # 建立数据库连接
         self.connection = pymysql.connect(
@@ -170,10 +177,14 @@ class FaceWindow(QMainWindow, QtStyleTools):
         feature = self.fs.get_face_feature(Image.fromarray(face))
         min_index, min_dis = self.calculate_distance(feature)
         print('min_dis', min_dis)
+
         if min_dis < 0.5:
             now = datetime.now()
             punch_time = now.strftime('%Y-%m-%d %H:%M:%S')
-            with self.cursor as cursor:
+
+            # 不使用 with 语句来避免自动关闭 cursor
+            cursor = self.connection.cursor()
+            try:
                 # 插入数据的 SQL 语句
                 if self.identities[min_index] == 'student':
                     sql = "INSERT INTO student_attendance (student_id, student_name, punch_time) VALUES (%s, %s, %s)"
@@ -185,11 +196,19 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 # 执行插入操作
                 cursor.execute(sql, values)
 
-            # 提交事务
-            self.connection.commit()
-            print("数据插入成功！")
+                # 提交事务
+                self.connection.commit()
+                print("数据插入成功！")
 
-            QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{self.register_ids[min_index]}')
+                QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{self.register_ids[min_index]}')
+            except Exception as e:
+                # 发生错误时回滚
+                self.connection.rollback()
+                print(f"数据库错误: {e}")
+                QtWidgets.QMessageBox.warning(self, '错误', f'数据库操作失败: {e}')
+            finally:
+                # 确保手动关闭游标
+                cursor.close()
         else:
             QtWidgets.QMessageBox.information(self, '提示', '人脸不在数据库中')
 
@@ -331,23 +350,43 @@ class FaceWindow(QMainWindow, QtStyleTools):
                     self.main.video.setPixmap(QPixmap.fromImage(img))
                 cv2.waitKey(int(1000 / 30))
 
-    def closeEvent(self, event):
-        # Set a flag to stop the display thread
+    def eventFilter(self, watched, event):
+        # 如果是主窗口且为关闭事件
+        if watched == self.main and event.type() == QEvent.Close:
+            print("Main window close event detected through event filter")
+            self.cleanup_resources()
+            # 不阻止关闭事件继续传播
+            return False
+        return super().eventFilter(watched, event)
+
+    def cleanup_resources(self):
+        """清理所有资源的函数"""
+        print("Cleaning up resources...")
+        # 设置标志停止显示线程
         self.open_flag = False
 
-        # Wait for the thread to finish
-        if self.th.is_alive():
-            self.th.join()
+        # 等待线程结束
+        if hasattr(self, 'th') and self.th.is_alive():
+            print("Waiting for display thread to finish...")
+            self.th.join(timeout=1.0)  # 添加超时以防止无限等待
+            print("Display thread finished or timeout reached")
 
-        # Release camera resource
-        if self.cap.isOpened():
+        # 释放摄像头资源
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            print("Releasing camera...")
             self.cap.release()
+            print("Camera released")
 
-        # Accept the close event
+        # 关闭数据库连接
+        if hasattr(self, 'connection') and self.connection:
+            print("Closing database connection...")
+            self.connection.close()
+            print("Database connection closed")
+
+    def closeEvent(self, event):
+        print("FaceWindow closeEvent triggered")
+        self.cleanup_resources()
         super().closeEvent(event)
-
-        # Ensure the application quits
-        QApplication.quit()
 
     def save_image(self, image, path):
         """
@@ -368,7 +407,9 @@ class FaceWindow(QMainWindow, QtStyleTools):
 
 
 
+
+
 if __name__ == '__main__':
-    app = QApplication([])
+    app = QApplication()
     window = FaceWindow()
     app.exec()
