@@ -1,7 +1,5 @@
 import threading
-
 import numpy as np
-
 import train
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt
@@ -10,7 +8,6 @@ from PySide6.QtGui import QImage, QPixmap
 from qt_material import apply_stylesheet, QtStyleTools, QUiLoader
 from face import *
 from PIL import Image
-
 import pymysql
 from datetime import datetime
 
@@ -116,7 +113,6 @@ class FaceWindow(QMainWindow, QtStyleTools):
         )
         self.cursor = self.connection.cursor()
 
-
     def save_feature(self, feature, register_id, name, identity):
         # save np feature to file
         id = len(os.listdir('../datas/faces'))
@@ -149,7 +145,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 for line in f.readlines():
                     line = line.strip()
                     register_id, name, identity = line.split(',')
-                    self.register_ids.append(register_id[1:])
+                    self.register_ids.append(register_id)
                     self.names.append(name)
                     self.identities.append(identity)
             self.features = np.array(self.features)
@@ -171,9 +167,6 @@ class FaceWindow(QMainWindow, QtStyleTools):
 
         face = np.ascontiguousarray(
             self.frame[self.faces[0][1]:self.faces[0][3], self.faces[0][0]:self.faces[0][2]])
-        #self.face_img.set_image(QImage(face.data, face.shape[1], face.shape[0], face.shape[1] * 3,
-                                       #QImage.Format_RGB888))
-        #self.face_img.setVisible(True)
         feature = self.fs.get_face_feature(Image.fromarray(face))
         min_index, min_dis = self.calculate_distance(feature)
         print('min_dis', min_dis)
@@ -182,9 +175,6 @@ class FaceWindow(QMainWindow, QtStyleTools):
             punch_time = now.strftime('%Y-%m-%d %H:%M:%S')
             with self.cursor as cursor:
                 # 插入数据的 SQL 语句
-                print(self.names[min_index])
-                print(self.register_ids[min_index])
-                print(self.identities[min_index])
                 if self.identities[min_index] == 'student':
                     sql = "INSERT INTO student_attendance (student_id, student_name, punch_time) VALUES (%s, %s, %s)"
                     values = (str(self.register_ids[min_index]), str(self.names[min_index]), punch_time)
@@ -202,7 +192,6 @@ class FaceWindow(QMainWindow, QtStyleTools):
             QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{self.register_ids[min_index]}')
         else:
             QtWidgets.QMessageBox.information(self, '提示', '人脸不在数据库中')
-        #self.face_img.setVisible(False)
 
     def register(self):
         with self.lock:  # 使用线程锁
@@ -345,7 +334,6 @@ class FaceWindow(QMainWindow, QtStyleTools):
     def closeEvent(self, event):
         # Set a flag to stop the display thread
         self.open_flag = False
-
 
         # Wait for the thread to finish
         if self.th.is_alive():
