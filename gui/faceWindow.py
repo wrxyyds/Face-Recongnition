@@ -2,7 +2,7 @@ import threading
 import numpy as np
 import train
 from PySide6 import QtWidgets
-from PySide6.QtCore import Qt, QEvent
+from PySide6.QtCore import Qt, QEvent, Signal
 from PySide6.QtWidgets import *
 from PySide6.QtGui import QImage, QPixmap
 from qt_material import apply_stylesheet, QtStyleTools, QUiLoader
@@ -70,7 +70,20 @@ class RegistrationDialog(QDialog):
         return student_id, name, identity
 
 
+class CustomLoader(QUiLoader):
+    def __init__(self, base_instance=None):
+        super().__init__()
+        self.base_instance = base_instance
+
+    def createWidget(self, class_name, parent=None, name=''):
+        if parent is None and self.base_instance:
+            return self.base_instance
+        return super().createWidget(class_name, parent, name)
+
+
 class FaceWindow(QMainWindow, QtStyleTools):
+    shutdown_signal = Signal()  # Define a signal for safe shutdown
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.open_flag = False
@@ -84,41 +97,55 @@ class FaceWindow(QMainWindow, QtStyleTools):
         self.names = None
         self.identities = None
         self.lock = threading.Lock()  # 添加线程锁
+        self.is_shutting_down = False  # Flag to track shutdown state
 
-        # load widgets form ui file
-        self.main = QUiLoader().load('ui.ui', self)
-        self.main.button1.clicked.connect(self.video_open_close)
-        self.main.button2.clicked.connect(self.register)
-        self.main.button3.clicked.connect(self.face_recognition)
-        apply_stylesheet(self.main, theme='light_blue.xml')
+        # Use CustomLoader to load UI directly into this instance
+        loader = CustomLoader(self)
+        loader.load('ui.ui')
 
-        # 安装事件过滤器以捕获关闭事件
-        self.main.installEventFilter(self)
+        # Connect signals
+        self.button1.clicked.connect(self.video_open_close)
+        self.button2.clicked.connect(self.register)
+        self.button3.clicked.connect(self.face_recognition)
 
-        # 连接应用程序的aboutToQuit信号到自定义清理函数
-        QApplication.instance().aboutToQuit.connect(self.cleanup_resources)
+        # Apply stylesheet
+        apply_stylesheet(self, theme='light_blue.xml')
+
+        # Connect shutdown signal to cleanup method
+        self.shutdown_signal.connect(self.cleanup_resources)
+
+        # Connect application quit signal
+        QApplication.instance().aboutToQuit.connect(self.on_app_quit)
 
         self.cap = cv2.VideoCapture(0)
         self.fs = FaceSystem()
         self.face_img = QShowImage()
 
-        # 只显示main窗口
-        self.main.show()
+        # 显示窗口
+        self.show()
 
+        # Start display thread
         self.th = threading.Thread(target=self.display)
+        self.th.daemon = True  # Make thread daemon so it exits when main thread exits
         self.th.start()
         self.load_feature()
 
         # 建立数据库连接
-        self.connection = pymysql.connect(
-            host='localhost',
-            user='root',
-            password='88888888',
-            database='face_reconginition',
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
-        )
-        self.cursor = self.connection.cursor()
+        try:
+            self.connection = pymysql.connect(
+                host='localhost',
+                user='root',
+                password='88888888',
+                database='face_reconginition',
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor
+            )
+            self.cursor = self.connection.cursor()
+        except pymysql.Error as e:
+            print(f"数据库连接错误: {e}")
+            self.connection = None
+            self.cursor = None
+            QtWidgets.QMessageBox.critical(self, '错误', f'数据库连接失败: {e}')
 
     def save_feature(self, feature, register_id, name, identity):
         # save np feature to file
@@ -182,10 +209,14 @@ class FaceWindow(QMainWindow, QtStyleTools):
             now = datetime.now()
             punch_time = now.strftime('%Y-%m-%d %H:%M:%S')
 
-            # 不使用 with 语句来避免自动关闭 cursor
-            cursor = self.connection.cursor()
+            if not self.connection:
+                QtWidgets.QMessageBox.warning(self, '错误', '数据库连接不可用')
+                return
+
+            cursor = None
             try:
                 # 插入数据的 SQL 语句
+                cursor = self.connection.cursor()
                 if self.identities[min_index] == 'student':
                     sql = "INSERT INTO student_attendance (student_id, student_name, punch_time) VALUES (%s, %s, %s)"
                     values = (str(self.register_ids[min_index]), str(self.names[min_index]), punch_time)
@@ -203,12 +234,14 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 QtWidgets.QMessageBox.information(self, '提示', f'人脸识别结果为{self.register_ids[min_index]}')
             except Exception as e:
                 # 发生错误时回滚
-                self.connection.rollback()
+                if self.connection:
+                    self.connection.rollback()
                 print(f"数据库错误: {e}")
                 QtWidgets.QMessageBox.warning(self, '错误', f'数据库操作失败: {e}')
             finally:
                 # 确保手动关闭游标
-                cursor.close()
+                if cursor:
+                    cursor.close()
         else:
             QtWidgets.QMessageBox.information(self, '提示', '人脸不在数据库中')
 
@@ -262,11 +295,11 @@ class FaceWindow(QMainWindow, QtStyleTools):
     def video_open_close(self):
         if self.open_flag:
             self.open_flag = False
-            self.main.button1.setText('打开摄像头')
-            self.main.video.clear()
+            self.button1.setText('打开摄像头')
+            self.video.clear()
         else:
             self.open_flag = True
-            self.main.button1.setText('关闭摄像头')
+            self.button1.setText('关闭摄像头')
 
     def get_max_boxes(self, faces: np.array):
         areas = (faces[:, 2] - faces[:, 0]) * (faces[:, 3] - faces[:, 1])
@@ -274,101 +307,138 @@ class FaceWindow(QMainWindow, QtStyleTools):
         return faces[max_index, :]
 
     def display(self):
-        while self.cap.isOpened():
-            if self.open_flag:
-                w, h = self.main.video.width(), self.main.video.height()
-                # success表示是否读取到帧， frame是读取到的numpy格式图片
-                success, frame = self.cap.read()
-                frame = cv2.resize(frame, (w - 20, h - 20), interpolation=cv2.INTER_AREA)
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                image = Image.fromarray(frame, mode='RGB')
-                # frame大小是(w - 20, h - 20)给组件预留空白
-                frame = Image.fromarray(frame, mode='RGB')
-                # 重新设置格式
-                image = image.resize((512, 512))
-                # mtcnn进行人脸检测返回一个二维numpy第0维度是数量，第一维度是四个坐标
-                faces = self.fs.face_detect(image)
-                faces = np.array(faces)
-                if faces.shape[0] > 0:
-                    # 选择面积最大的box，此时faces是一维的
-                    faces = self.get_max_boxes(faces)
-                    # 添加一个新的维度，归一化。以frame的尺度计算得到人脸坐标
-                    faces = faces[np.newaxis, :]
-                    faces = faces / 512
-                    faces[:, 0] = faces[:, 0] * (w - 20)
-                    faces[:, 1] = faces[:, 1] * (h - 20)
-                    faces[:, 2] = faces[:, 2] * (w - 20)
-                    faces[:, 3] = faces[:, 3] * (h - 20)
-                    faces = faces.astype(int)
-                    # 将人脸坐标画出来
-                    frame = draw_bboxes(frame, faces)
-                    with self.lock:  # 使用线程锁
-                        # 将faces在内存空间连续排列
-                        self.faces = np.ascontiguousarray(faces)
-                self.frame = np.ascontiguousarray(np.array(frame))
-                # 将PIL格式转为QImage self.frame.data返回存储数据指针，在使用前确保连续存储
-                img = QImage(self.frame.data, self.frame.shape[1], self.frame.shape[0], self.frame.shape[1] * 3,
-                             QImage.Format_RGB888)
+        try:
+            while self.cap.isOpened() and not self.is_shutting_down:
                 if self.open_flag:
-                    # 将图片显示到QLabel标签中其中main.vedio是一个标签
-                    self.main.video.setPixmap(QPixmap.fromImage(img))
-                success, frame = self.cap.read()
-                frame = cv2.resize(frame, (w - 20, h - 20), interpolation=cv2.INTER_AREA)
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                image = Image.fromarray(frame, mode='RGB')
-                # frame大小是(w - 20, h - 20)给组件预留空白
-                frame = Image.fromarray(frame, mode='RGB')
-                # 重新设置格式
-                image = image.resize((512, 512))
-                # mtcnn进行人脸检测返回一个二维numpy第0维度是数量，第一维度是四个坐标
-                faces = self.fs.face_detect(image)
-                faces = np.array(faces)
-                if faces.shape[0] > 0:
-                    # 选择面积最大的box，此时faces是一维的
-                    faces = self.get_max_boxes(faces)
-                    # 添加一个新的维度，归一化。以frame的尺度计算得到人脸坐标
-                    faces = faces[np.newaxis, :]
-                    faces = faces / 512
-                    faces[:, 0] = faces[:, 0] * (w - 20)
-                    faces[:, 1] = faces[:, 1] * (h - 20)
-                    faces[:, 2] = faces[:, 2] * (w - 20)
-                    faces[:, 3] = faces[:, 3] * (h - 20)
-                    faces = faces.astype(int)
-                    # 将人脸坐标画出来
-                    frame = draw_bboxes(frame, faces)
-                    with self.lock:  # 使用线程锁
-                        # 将faces在内存空间连续排列
-                        self.another_faces = np.ascontiguousarray(faces)
-                self.another_frame = np.ascontiguousarray(np.array(frame))
+                    try:
+                        w, h = self.video.width(), self.video.height()
+                        # success表示是否读取到帧， frame是读取到的numpy格式图片
+                        success, frame = self.cap.read()
+                        if not success:
+                            print("Failed to read frame from camera")
+                            time.sleep(0.1)
+                            continue
 
-                # 使用当前帧的数据创建QImage，而不是self.frame
-                img = QImage(self.another_frame.data, self.another_frame.shape[1], self.another_frame.shape[0],
-                             self.another_frame.shape[1] * 3, QImage.Format_RGB888)
+                        frame = cv2.resize(frame, (w - 20, h - 20), interpolation=cv2.INTER_AREA)
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        image = Image.fromarray(frame, mode='RGB')
+                        # frame大小是(w - 20, h - 20)给组件预留空白
+                        frame = Image.fromarray(frame, mode='RGB')
+                        # 重新设置格式
+                        image = image.resize((512, 512))
+                        # mtcnn进行人脸检测返回一个二维numpy第0维度是数量，第一维度是四个坐标
+                        faces = self.fs.face_detect(image)
+                        faces = np.array(faces)
+                        if faces.shape[0] > 0:
+                            # 选择面积最大的box，此时faces是一维的
+                            faces = self.get_max_boxes(faces)
+                            # 添加一个新的维度，归一化。以frame的尺度计算得到人脸坐标
+                            faces = faces[np.newaxis, :]
+                            faces = faces / 512
+                            faces[:, 0] = faces[:, 0] * (w - 20)
+                            faces[:, 1] = faces[:, 1] * (h - 20)
+                            faces[:, 2] = faces[:, 2] * (w - 20)
+                            faces[:, 3] = faces[:, 3] * (h - 20)
+                            faces = faces.astype(int)
+                            # 将人脸坐标画出来
+                            frame = draw_bboxes(frame, faces)
+                            with self.lock:  # 使用线程锁
+                                # 将faces在内存空间连续排列
+                                self.faces = np.ascontiguousarray(faces)
+                        self.frame = np.ascontiguousarray(np.array(frame))
+                        # 将PIL格式转为QImage self.frame.data返回存储数据指针，在使用前确保连续存储
+                        img = QImage(self.frame.data, self.frame.shape[1], self.frame.shape[0], self.frame.shape[1] * 3,
+                                     QImage.Format_RGB888)
+                        if self.open_flag and not self.is_shutting_down:
+                            # 将图片显示到QLabel标签中其中video是一个标签
+                            self.video.setPixmap(QPixmap.fromImage(img))
 
-                if self.open_flag:
-                    # 将图片显示到QLabel标签中
-                    self.main.video.setPixmap(QPixmap.fromImage(img))
-                cv2.waitKey(int(1000 / 30))
+                        success, frame = self.cap.read()
+                        if not success:
+                            continue
 
-    def eventFilter(self, watched, event):
-        # 如果是主窗口且为关闭事件
-        if watched == self.main and event.type() == QEvent.Close:
-            print("Main window close event detected through event filter")
+                        frame = cv2.resize(frame, (w - 20, h - 20), interpolation=cv2.INTER_AREA)
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        image = Image.fromarray(frame, mode='RGB')
+                        # frame大小是(w - 20, h - 20)给组件预留空白
+                        frame = Image.fromarray(frame, mode='RGB')
+                        # 重新设置格式
+                        image = image.resize((512, 512))
+                        # mtcnn进行人脸检测返回一个二维numpy第0维度是数量，第一维度是四个坐标
+                        faces = self.fs.face_detect(image)
+                        faces = np.array(faces)
+                        if faces.shape[0] > 0:
+                            # 选择面积最大的box，此时faces是一维的
+                            faces = self.get_max_boxes(faces)
+                            # 添加一个新的维度，归一化。以frame的尺度计算得到人脸坐标
+                            faces = faces[np.newaxis, :]
+                            faces = faces / 512
+                            faces[:, 0] = faces[:, 0] * (w - 20)
+                            faces[:, 1] = faces[:, 1] * (h - 20)
+                            faces[:, 2] = faces[:, 2] * (w - 20)
+                            faces[:, 3] = faces[:, 3] * (h - 20)
+                            faces = faces.astype(int)
+                            # 将人脸坐标画出来
+                            frame = draw_bboxes(frame, faces)
+                            with self.lock:  # 使用线程锁
+                                # 将faces在内存空间连续排列
+                                self.another_faces = np.ascontiguousarray(faces)
+                        self.another_frame = np.ascontiguousarray(np.array(frame))
+
+                        # 使用当前帧的数据创建QImage，而不是self.frame
+                        img = QImage(self.another_frame.data, self.another_frame.shape[1], self.another_frame.shape[0],
+                                     self.another_frame.shape[1] * 3, QImage.Format_RGB888)
+
+                        if self.open_flag and not self.is_shutting_down:
+                            # 将图片显示到QLabel标签中
+                            self.video.setPixmap(QPixmap.fromImage(img))
+
+                        cv2.waitKey(int(1000 / 30))
+
+                    except Exception as e:
+                        print(f"Error in display loop: {e}")
+                        time.sleep(0.1)
+                else:
+                    # Avoid high CPU usage when camera is closed
+                    time.sleep(0.1)
+        except Exception as e:
+            print(f"Display thread crashed: {e}")
+        finally:
+            print("Display thread terminated")
+
+    def closeEvent(self, event):
+        """Handle window close event"""
+        print("FaceWindow closeEvent triggered")
+        # Prevent multiple closeEvent handling
+        if not self.is_shutting_down:
+            self.is_shutting_down = True
+            self.shutdown_signal.emit()
+            # Accept the event after cleanup signal is emitted
+            event.accept()
+        else:
+            # Already shutting down, just accept the event
+            event.accept()
+
+    def on_app_quit(self):
+        """Handle application quit signal"""
+        print("Application quit signal received")
+        if not self.is_shutting_down:
+            self.is_shutting_down = True
             self.cleanup_resources()
-            # 不阻止关闭事件继续传播
-            return False
-        return super().eventFilter(watched, event)
 
     def cleanup_resources(self):
         """清理所有资源的函数"""
         print("Cleaning up resources...")
+
         # 设置标志停止显示线程
         self.open_flag = False
+        self.is_shutting_down = True
 
-        # 等待线程结束
+        # 等待线程结束，使用较短的超时防止无限等待
         if hasattr(self, 'th') and self.th.is_alive():
             print("Waiting for display thread to finish...")
-            self.th.join(timeout=1.0)  # 添加超时以防止无限等待
+            # Shorter timeout to avoid blocking UI for too long
+            self.th.join(timeout=0.5)
             print("Display thread finished or timeout reached")
 
         # 释放摄像头资源
@@ -380,13 +450,10 @@ class FaceWindow(QMainWindow, QtStyleTools):
         # 关闭数据库连接
         if hasattr(self, 'connection') and self.connection:
             print("Closing database connection...")
+            if hasattr(self, 'cursor') and self.cursor:
+                self.cursor.close()
             self.connection.close()
             print("Database connection closed")
-
-    def closeEvent(self, event):
-        print("FaceWindow closeEvent triggered")
-        self.cleanup_resources()
-        super().closeEvent(event)
 
     def save_image(self, image, path):
         """
@@ -406,10 +473,19 @@ class FaceWindow(QMainWindow, QtStyleTools):
         cv2.imwrite(path, image)
 
 
-
-
-
 if __name__ == '__main__':
-    app = QApplication()
+    import sys
+    import time
+
+
+    # Add exception hook to catch unhandled exceptions
+    def exception_hook(exctype, value, traceback):
+        print(f"Unhandled exception: {exctype.__name__}: {value}")
+        sys.__excepthook__(exctype, value, traceback)
+
+
+    sys.excepthook = exception_hook
+
+    app = QApplication(sys.argv)
     window = FaceWindow()
-    app.exec()
+    sys.exit(app.exec())
