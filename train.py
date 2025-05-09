@@ -239,8 +239,40 @@ class EnhancedFaceDataset(torch.utils.data.Dataset):
         self.triplets = self.generate_triplets()
 
 
+def freeze_layers(model, freeze_ratio=0.7):
+    """
+    冻结模型一部分层的权重
+
+    Args:
+        model: 要冻结的模型
+        freeze_ratio: 要冻结的层的比例（从前往后计算）
+    """
+    # 获取所有参数
+    all_params = list(model.named_parameters())
+
+    # 确定要冻结的参数数量
+    num_to_freeze = int(len(all_params) * freeze_ratio)
+
+    # 冻结前面的层
+    print(f"冻结前 {num_to_freeze} 层参数（共 {len(all_params)} 层）")
+    frozen_count = 0
+
+    for name, param in all_params[:num_to_freeze]:
+        param.requires_grad = False
+        frozen_count += 1
+
+    # 记录要训练的参数数量
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+
+    print(f"已冻结 {frozen_count} 层参数")
+    print(f"可训练参数: {trainable_params:,} / {total_params:,} ({trainable_params / total_params:.2%})")
+
+    return model
+
+
 # 优化的训练函数
-def train(cls):
+def train(cls, freeze_ratio=0.7):
     img_path = '../images/train/'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
@@ -280,6 +312,9 @@ def train(cls):
 
     model.to(device)
 
+    # 冻结一部分层的权重
+    model = freeze_layers(model, freeze_ratio)
+
     # 创建进度对话框
     progress_dialog = QProgressDialog("训练中...", "取消", 0, 100)
     progress_dialog.setWindowTitle("训练进度")
@@ -287,7 +322,9 @@ def train(cls):
     progress_dialog.show()
 
     # 添加权重衰减和更好的优化器
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    # 只优化未冻结的参数
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
+                           lr=0.001, weight_decay=1e-4)
 
     # 使用更好的学习率计划，基于有效的验证损失
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2,
@@ -419,4 +456,5 @@ def generate_augmented_samples(cls_dir, min_samples=6):
 
 
 if __name__ == "__main__":
-    train('2107090712')
+    # 添加可选参数控制冻结层的比例（默认冻结70%的层）
+    train('2107090712', freeze_ratio=0.7)

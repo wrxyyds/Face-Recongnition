@@ -666,11 +666,14 @@ class FaceWindow(QMainWindow, QtStyleTools):
                     # Reload face system to include new model
                     self.fs = FaceSystem()
 
+
                     # Extract feature with updated model for better accuracy
                     feature = self.fs.get_face_feature(Image.fromarray(face_images[0]))
 
                     # Save feature to database
                     self.save_feature(feature, str(register_id), str(name), str(identity))
+                    self.reload()
+                    print('reload finish')
 
                     QMessageBox.information(self, '提示', f'人脸注册成功！')
 
@@ -729,6 +732,65 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 # 如果重新打开失败，确保设置正确的状态
                 self.open_flag = False
                 self.button1.setText('打开摄像头')
+
+    def reload(self):
+        try:
+            # 1. 读取注册信息
+            names_file = '../datas/names.txt'
+            if not os.path.exists(names_file):
+                QMessageBox.warning(self, '警告', '注册信息文件不存在')
+                return
+
+            with open(names_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if not lines:
+                # QMessageBox.warning(self, '警告', '没有注册用户信息')
+                return
+
+            # 2. 遍历每个注册用户，更新特征
+            for i, line in enumerate(lines):
+                register_id, name, identity = line.strip().split(',')
+
+                # 查找对应图片文件夹
+                image_folder = f'../images/train/{register_id}'
+                if not os.path.exists(image_folder):
+                    logger.warning(f"用户{register_id}的图片文件夹不存在")
+                    continue
+
+                # 获取文件夹中的第一张图片
+                image_files = [f for f in os.listdir(image_folder)
+                               if f.endswith(('.jpg', '.jpeg', '.png'))]
+                if not image_files:
+                    logger.warning(f"用户{register_id}的图片文件夹为空")
+                    continue
+
+                image_path = os.path.join(image_folder, image_files[0])
+
+                # 3. 提取新特征
+                try:
+                    image = Image.open(image_path).convert('RGB')
+                    new_feature = self.fs.get_face_feature(image)
+
+                    # 4. 替换原有特征文件
+                    feature_file = f'../datas/faces/{i}.npy'
+                    np.save(feature_file, new_feature)
+                    logger.info(f"更新用户{register_id}的特征成功")
+
+                except Exception as e:
+                    logger.error(f"更新用户{register_id}的特征失败: {e}")
+                    continue
+
+            # 5. 清空并重新加载特征
+            self.features = np.empty((0, 0))
+            self.load_feature()
+
+            QMessageBox.information(self, '提示', '人脸特征重新加载完成')
+
+        except Exception as e:
+            logger.error(f"重新加载人脸特征失败: {e}")
+            QMessageBox.critical(self, '错误', f'重新加载人脸特征失败: {str(e)}')
+
 
     def video_open_close(self):
         """打开或关闭摄像头"""
