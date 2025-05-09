@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import numpy as np
 import train
@@ -97,15 +98,15 @@ class FaceCaptureDialog(QDialog):
         self.status_label = QLabel("Initializing camera...")
         self.status_label.setAlignment(Qt.AlignCenter)
 
-        self.capture_button = QPushButton("Capture Face")
+        self.capture_button = QPushButton("捕捉图片")
         self.capture_button.clicked.connect(self.capture_face)
         self.capture_button.setEnabled(False)  # Disabled until camera is ready
 
-        self.complete_button = QPushButton("Complete")
+        self.complete_button = QPushButton("完成")
         self.complete_button.setEnabled(False)
         self.complete_button.clicked.connect(self.accept)
 
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("取消")
         self.cancel_button.clicked.connect(self.reject)
 
         # Face preview area
@@ -509,10 +510,10 @@ class FaceWindow(QMainWindow, QtStyleTools):
             self.cursor = None
             QtWidgets.QMessageBox.critical(self, '错误', f'数据库连接失败: {e}')
 
-    def save_feature(self, feature, register_id, name, identity):
+    def save_feature(self, register_id, name, identity):
         # save np feature to file
-        id = len(os.listdir('../datas/faces'))
-        np.save(f'../datas/faces/{id}.npy', feature)
+        # id = len(os.listdir('../datas/faces'))
+        # np.save(f'../datas/faces/{id}.npy', feature)
         with open('../datas/names.txt', 'a', encoding='utf-8') as f:
             f.write(str(register_id))
             f.write(',')
@@ -520,13 +521,13 @@ class FaceWindow(QMainWindow, QtStyleTools):
             f.write(',')
             f.write(identity)
             f.write('\n')
-        if self.features.shape[0] != 0:
+        '''if self.features.shape[0] != 0:
             self.features = np.concatenate((self.features, feature), axis=0)
         else:
             self.features = feature.reshape(1, -1)
         self.register_ids.append(register_id)
         self.names.append(name)
-        self.identities.append(identity)
+        self.identities.append(identity)'''
 
     def load_feature(self):
         self.features = []
@@ -567,7 +568,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
         min_index, min_dis = self.calculate_distance(feature)
         print('min_dis', min_dis)
 
-        if min_dis < 0.5:
+        if min_dis < 0.8:
             now = datetime.now()
             punch_time = now.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -643,7 +644,7 @@ class FaceWindow(QMainWindow, QtStyleTools):
                 # Check if face already exists in the database
                 if self.features.shape[0] != 0:
                     min_index, min_dis = self.calculate_distance(feature)
-                    if min_dis < 0.5:
+                    if min_dis < 0.8:
                         QMessageBox.warning(self, '提示', f'该人脸已经注册过!')
                         return
 
@@ -661,17 +662,16 @@ class FaceWindow(QMainWindow, QtStyleTools):
                         self.save_image(face_img, f'../images/train/{register_id}/face_{i}.jpg')
 
                     # Train the model with new images
-                    train.train(str(register_id))
+                    train.train()
 
                     # Reload face system to include new model
                     self.fs = FaceSystem()
-
 
                     # Extract feature with updated model for better accuracy
                     feature = self.fs.get_face_feature(Image.fromarray(face_images[0]))
 
                     # Save feature to database
-                    self.save_feature(feature, str(register_id), str(name), str(identity))
+                    self.save_feature(str(register_id), str(name), str(identity))
                     self.reload()
                     print('reload finish')
 

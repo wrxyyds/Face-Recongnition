@@ -1,6 +1,8 @@
 import os
 import random
-import numpy as np
+
+from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +12,6 @@ from torchvision import transforms
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from PIL import Image
 from face.facenet.model import Resnet34Triplet
-from PySide6.QtCore import Qt
 
 
 # 增强的数据集类
@@ -272,31 +273,20 @@ def freeze_layers(model, freeze_ratio=0.7):
 
 
 # 优化的训练函数
-def train(cls, freeze_ratio=0.7):
+def train(freeze_ratio=0.7):
     img_path = '../images/train/'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 增强的数据增强
+    # 取消数据增强，只保留必要的变换
     transform_train = transforms.Compose([
-        transforms.Resize((160, 160)),
-        transforms.RandomHorizontalFlip(p=0.3),
-        transforms.RandomRotation(5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(
+        transforms.Resize((160, 160)),  # 调整图像大小
+        transforms.ToTensor(),  # 转换为张量
+        transforms.Normalize(  # 归一化
             mean=[0.6071, 0.4609, 0.3944],
             std=[0.2457, 0.2175, 0.2129]
         )
     ])
-
-    # 创建目标类别的目录
-    cls_dir = os.path.join(img_path, cls)
-    if not os.path.exists(cls_dir):
-        os.makedirs(cls_dir)
-
-    # 生成额外的数据增强样本（如果图像很少）
-    generate_augmented_samples(cls_dir)
 
     # 加载或初始化模型
     if os.path.exists('../face/facenet/weights/transferred_facenet_model.pt'):
@@ -314,12 +304,6 @@ def train(cls, freeze_ratio=0.7):
 
     # 冻结一部分层的权重
     model = freeze_layers(model, freeze_ratio)
-
-    # 创建进度对话框
-    progress_dialog = QProgressDialog("训练中...", "取消", 0, 100)
-    progress_dialog.setWindowTitle("训练进度")
-    progress_dialog.setWindowModality(Qt.WindowModal)
-    progress_dialog.show()
 
     # 添加权重衰减和更好的优化器
     # 只优化未冻结的参数
@@ -340,119 +324,151 @@ def train(cls, freeze_ratio=0.7):
     best_loss = float('inf')
     patience_counter = 0
 
-    # 初始化数据集
-    dataset = EnhancedFaceDataset(
-        root_dir=img_path,
-        target_cls=cls,
-        transform=transform_train,
-        use_hard_triplets=True,
-        model=model
-    )
+    # 获取所有类别
+    classes = [cls for cls in os.listdir('../images/train') if os.path.isdir(os.path.join('../images/train', cls))]
+    total_classes = len(classes)
 
-    for epoch in range(num_epochs):
-        # 刷新三元组
-        if epoch > 0:
-            dataset.model = model  # 更新模型引用
-            dataset.refresh_triplets()  # 基于当前模型状态刷新三元组
+    # 计算总迭代次数（用于进度计算）
+    total_iterations = total_classes * num_epochs
+    current_iteration = 0
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # 创建提示框
+    from PySide6.QtWidgets import QMessageBox
+    msg_box = QMessageBox()
+    msg_box.setWindowTitle("训练进行中")
+    msg_box.setText("训练正在进行中，请稍候...")
+    msg_box.setStandardButtons(QMessageBox.NoButton)  # 不显示任何按钮
+    msg_box.setWindowModality(Qt.WindowModal)  # 模态窗口，阻止用户操作其他窗口
+    msg_box.show()
 
-        # 训练一个轮次
-        model.train()
-        running_loss = 0.0
-        batch_count = 0
+    for cls_idx, cls in enumerate(classes):
+        # 初始化数据集
+        dataset = EnhancedFaceDataset(
+            root_dir=img_path,
+            target_cls=cls,
+            transform=transform_train,
+            use_hard_triplets=True,
+            model=model
+        )
 
-        for i, (anchor, positive, negative) in enumerate(dataloader):
-            # 将数据移至设备
-            anchor = anchor.to(device)
-            positive = positive.to(device)
-            negative = negative.to(device)
+        for epoch in range(num_epochs):
+            # 刷新三元组
+            if epoch > 0:
+                dataset.model = model  # 更新模型引用
+                dataset.refresh_triplets()  # 基于当前模型状态刷新三元组
 
-            # 清零参数梯度
-            optimizer.zero_grad()
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-            # 前向传播
-            anchor_embedding = model(anchor)
-            positive_embedding = model(positive)
-            negative_embedding = model(negative)
+            # 训练一个轮次
+            model.train()
+            running_loss = 0.0
+            batch_count = 0
 
-            # 计算三元组损失
-            loss = criterion(anchor_embedding, positive_embedding, negative_embedding)
+            for i, (anchor, positive, negative) in enumerate(dataloader):
+                # 将数据移至设备
+                anchor = anchor.to(device)
+                positive = positive.to(device)
+                negative = negative.to(device)
 
-            # 反向传播和优化
-            loss.backward()
-            optimizer.step()
+                # 清零参数梯度
+                optimizer.zero_grad()
 
-            # 统计
-            running_loss += loss.item()
-            batch_count += 1
+                # 前向传播
+                anchor_embedding = model(anchor)
+                positive_embedding = model(positive)
+                negative_embedding = model(negative)
 
-            # 更新对话框进度
-            progress = int((epoch * len(dataloader) + i + 1) / (num_epochs * len(dataloader)) * 100)
-            progress_dialog.setValue(progress)
+                # 计算三元组损失
+                loss = criterion(anchor_embedding, positive_embedding, negative_embedding)
 
-            if progress_dialog.wasCanceled():
-                print("训练已取消")
-                return
+                # 反向传播和优化
+                loss.backward()
+                optimizer.step()
 
-        # 计算平均损失
-        epoch_loss = running_loss / batch_count if batch_count > 0 else float('inf')
-        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}')
+                # 统计
+                running_loss += loss.item()
+                batch_count += 1
 
-        # 更新学习率调度器
-        scheduler.step(epoch_loss)
+                # 打印详细进度
+                if i % 5 == 0:  # 每5个批次打印一次进度
+                    progress = (i + 1) / len(dataloader) * 100
+                    print(
+                        f"类别 {cls_idx + 1}/{total_classes}, 轮次 {epoch + 1}/{num_epochs}, 批次 {i + 1}/{len(dataloader)}: {progress:.1f}%")
 
-        # 早停检查
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            # 保存最佳模型
-            torch.save(model.state_dict(), '../face/facenet/weights/transferred_facenet_model.pt')
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
+            # 计算平均损失
+            epoch_loss = running_loss / batch_count if batch_count > 0 else float('inf')
+            print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}')
 
-    # 确保进度对话框完成
-    progress_dialog.setValue(100)
+            # 更新学习率调度器
+            scheduler.step(epoch_loss)
+
+            # 早停检查
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                # 保存最佳模型
+                torch.save(model.state_dict(), '../face/facenet/weights/transferred_facenet_model.pt')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
+
+            # 更新当前迭代计数
+            current_iteration += 1
+
+            # 更新提示框文本
+            progress_percentage = (current_iteration / total_iterations) * 100
+            msg_box.setText(
+                f"训练进行中 ({progress_percentage:.1f}%)...\n\n当前：类别 {cls_idx + 1}/{total_classes}, 轮次 {epoch + 1}/{num_epochs}")
+
+            # 处理Qt事件，确保界面响应
+            import sys
+            if sys.platform.startswith('win'):
+                # 在Windows上需要更频繁地处理事件
+                QApplication.processEvents()
+
+    # 训练完成后关闭提示框
+    msg_box.accept()
     print("训练完成")
 
+    # 显示训练完成的消息
+    QMessageBox.information(None, "训练完成", "模型训练已成功完成！")
 
-def generate_augmented_samples(cls_dir, min_samples=6):
-    """为类别生成额外的增强样本"""
-    # 获取目录中的图像文件
-    img_files = [f for f in os.listdir(cls_dir)
-                 if f.endswith(('.jpg', '.jpeg', '.png'))]
-
-    # 如果样本数量已经足够，则不需要生成
-    if len(img_files) >= min_samples:
-        return
-
-    # 定义增强变换
-    augmentations = [
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.GaussianBlur(3, sigma=(0.1, 0.5))
-    ]
-
-    # 为每个原始图像生成新的增强版本
-    for img_file in img_files[:]:  # 使用原始列表副本
-        img_path = os.path.join(cls_dir, img_file)
-        img = Image.open(img_path).convert('RGB')
-
-        # 生成文件名不包含扩展名的部分
-        file_base = os.path.splitext(img_file)[0]
-
-        # 应用每个增强并保存新图像
-        for i, transform in enumerate(augmentations):
-            augmented_img = transform(img)
-            aug_filename = f"{file_base}_aug{i}.jpg"
-            aug_path = os.path.join(cls_dir, aug_filename)
-            augmented_img.save(aug_path)
-
-    print(f"为 {cls_dir} 生成了增强样本")
+# def generate_augmented_samples(cls_dir, min_samples=6):
+#     """为类别生成额外的增强样本"""
+#     # 获取目录中的图像文件
+#     img_files = [f for f in os.listdir(cls_dir)
+#                  if f.endswith(('.jpg', '.jpeg', '.png'))]
+#
+#     # 如果样本数量已经足够，则不需要生成
+#     if len(img_files) >= min_samples:
+#         return
+#
+#     # 定义增强变换
+#     augmentations = [
+#         transforms.RandomHorizontalFlip(p=1.0),
+#         transforms.RandomRotation(10),
+#         transforms.ColorJitter(brightness=0.2, contrast=0.2),
+#         transforms.GaussianBlur(3, sigma=(0.1, 0.5))
+#     ]
+#
+#     # 为每个原始图像生成新的增强版本
+#     for img_file in img_files[:]:  # 使用原始列表副本
+#         img_path = os.path.join(cls_dir, img_file)
+#         img = Image.open(img_path).convert('RGB')
+#
+#         # 生成文件名不包含扩展名的部分
+#         file_base = os.path.splitext(img_file)[0]
+#
+#         # 应用每个增强并保存新图像
+#         for i, transform in enumerate(augmentations):
+#             augmented_img = transform(img)
+#             aug_filename = f"{file_base}_aug{i}.jpg"
+#             aug_path = os.path.join(cls_dir, aug_filename)
+#             augmented_img.save(aug_path)
+#
+#     print(f"为 {cls_dir} 生成了增强样本")
 
 
 if __name__ == "__main__":
