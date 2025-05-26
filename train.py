@@ -17,14 +17,6 @@ from face.facenet.model import Resnet34Triplet
 # 增强的数据集类
 class EnhancedFaceDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir, target_cls, transform=None, use_hard_triplets=True, model=None):
-        """
-        Args:
-            root_dir (string): 包含所有人脸图像的目录，按身份组织
-            target_cls (string): 目标注册的类别（学号/ID）
-            transform (callable, optional): 应用于样本的变换
-            use_hard_triplets (bool): 是否使用困难三元组挖掘
-            model (nn.Module): 用于计算嵌入以进行困难三元组挖掘的模型
-        """
         self.root_dir = root_dir
         self.target_cls = target_cls
         self.transform = transform
@@ -109,7 +101,6 @@ class EnhancedFaceDataset(torch.utils.data.Dataset):
         return triplets
 
     def generate_smart_triplets(self):
-        """基于当前模型状态生成智能三元组"""
         identity_dict = {}
         # 按身份将索引分组
         for idx, (_, identity) in enumerate(self.samples):

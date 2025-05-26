@@ -75,8 +75,7 @@ class RegistrationDialog(QDialog):
 
 
 class FaceCaptureDialog(QDialog):
-    """Dialog for capturing multiple face images with visual feedback"""
-    capture_complete = Signal(list)  # Signal to emit when capture is complete with list of face images
+    capture_complete = Signal(list)
 
     def __init__(self, parent=None, face_system=None):
         super().__init__(parent)
@@ -100,7 +99,7 @@ class FaceCaptureDialog(QDialog):
 
         self.capture_button = QPushButton("捕捉图片")
         self.capture_button.clicked.connect(self.capture_face)
-        self.capture_button.setEnabled(False)  # Disabled until camera is ready
+        self.capture_button.setEnabled(False)
 
         self.complete_button = QPushButton("完成")
         self.complete_button.setEnabled(False)
@@ -142,7 +141,6 @@ class FaceCaptureDialog(QDialog):
         self.timer.timeout.connect(self.update_camera)
 
     def initialize_camera(self):
-        """Initialize the camera with proper error handling"""
         try:
             self.status_label.setText("Initializing camera...")
             QApplication.processEvents()
