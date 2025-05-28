@@ -176,7 +176,7 @@ class EnhancedFaceDataset(torch.utils.data.Dataset):
 
                     triplets.append((anchor_idx, hardest_positive_idx, semi_hard_neg_idx))
 
-        # 为其他类别生成一些三元组以维持多样性
+        # 为其他类别生成一些三元组
         other_identities = [i for i in valid_identities if i != self.target_cls]
         for identity in other_identities:
             if len(identity_dict[identity]) >= 2:
@@ -232,13 +232,6 @@ class EnhancedFaceDataset(torch.utils.data.Dataset):
 
 
 def freeze_layers(model, freeze_ratio=0.7):
-    """
-    冻结模型一部分层的权重
-
-    Args:
-        model: 要冻结的模型
-        freeze_ratio: 要冻结的层的比例（从前往后计算）
-    """
     # 获取所有参数
     all_params = list(model.named_parameters())
 

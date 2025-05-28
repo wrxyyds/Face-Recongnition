@@ -1,498 +1,816 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import torchvision.transforms as transforms
+from PIL import Image, ImageEnhance
 import numpy as np
-import os
-import cv2
-import pandas as pd
+import random
+import json
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# 导入MTCNN模型
+from face.mtcnn.model import PNet, RNet, ONet
+from face.mtcnn.box_utils import convert_to_square, calibrate_box, get_image_boxes
 
 
-# MTCNN网络架构定义
-class PNet(nn.Module):
-    """Proposal Network (P-Net) - 12x12输入"""
-
-    def __init__(self):
-        super(PNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 10, kernel_size=3, stride=1)
-        self.prelu1 = nn.PReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self.conv2 = nn.Conv2d(10, 16, kernel_size=3, stride=1)
-        self.prelu2 = nn.PReLU()
-
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, stride=1)
-        self.prelu3 = nn.PReLU()
-
-        # 分类分支
-        self.conv4_1 = nn.Conv2d(32, 2, kernel_size=1, stride=1)
-        # 边界框回归分支
-        self.conv4_2 = nn.Conv2d(32, 4, kernel_size=1, stride=1)
-        # 关键点回归分支
-        self.conv4_3 = nn.Conv2d(32, 10, kernel_size=1, stride=1)
-
-    def forward(self, x):
-        x = self.pool1(self.prelu1(self.conv1(x)))
-        x = self.prelu2(self.conv2(x))
-        x = self.prelu3(self.conv3(x))
-
-        cls = torch.sigmoid(self.conv4_1(x))
-        bbox = self.conv4_2(x)
-        landmark = self.conv4_3(x)
-
-        return cls, bbox, landmark
-
-
-class RNet(nn.Module):
-    """Refine Network (R-Net) - 24x24输入"""
-
-    def __init__(self):
-        super(RNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 28, kernel_size=3, stride=1)
-        self.prelu1 = nn.PReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2)
-
-        self.conv2 = nn.Conv2d(28, 48, kernel_size=3, stride=1)
-        self.prelu2 = nn.PReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=3, stride=2)
-
-        self.conv3 = nn.Conv2d(48, 64, kernel_size=2, stride=1)
-        self.prelu3 = nn.PReLU()
-
-        self.fc4 = nn.Linear(64 * 3 * 3, 128)
-        self.prelu4 = nn.PReLU()
-
-        # 分类分支
-        self.fc5_1 = nn.Linear(128, 2)
-        # 边界框回归分支
-        self.fc5_2 = nn.Linear(128, 4)
-        # 关键点回归分支
-        self.fc5_3 = nn.Linear(128, 10)
-
-    def forward(self, x):
-        x = self.pool1(self.prelu1(self.conv1(x)))
-        x = self.pool2(self.prelu2(self.conv2(x)))
-        x = self.prelu3(self.conv3(x))
-
-        x = x.view(x.size(0), -1)
-        x = self.prelu4(self.fc4(x))
-
-        cls = torch.sigmoid(self.fc5_1(x))
-        bbox = self.fc5_2(x)
-        landmark = self.fc5_3(x)
-
-        return cls, bbox, landmark
-
-
-class ONet(nn.Module):
-    """Output Network (O-Net) - 48x48输入"""
-
-    def __init__(self):
-        super(ONet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1)
-        self.prelu1 = nn.PReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2)
-
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
-        self.prelu2 = nn.PReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=3, stride=2)
-
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.prelu3 = nn.PReLU()
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self.conv4 = nn.Conv2d(64, 128, kernel_size=2, stride=1)
-        self.prelu4 = nn.PReLU()
-
-        self.fc5 = nn.Linear(128 * 3 * 3, 256)
-        self.prelu5 = nn.PReLU()
-
-        # 分类分支
-        self.fc6_1 = nn.Linear(256, 2)
-        # 边界框回归分支
-        self.fc6_2 = nn.Linear(256, 4)
-        # 关键点回归分支
-        self.fc6_3 = nn.Linear(256, 10)
-
-    def forward(self, x):
-        x = self.pool1(self.prelu1(self.conv1(x)))
-        x = self.pool2(self.prelu2(self.conv2(x)))
-        x = self.pool3(self.prelu3(self.conv3(x)))
-        x = self.prelu4(self.conv4(x))
-
-        x = x.view(x.size(0), -1)
-        x = self.prelu5(self.fc5(x))
-
-        cls = torch.sigmoid(self.fc6_1(x))
-        bbox = self.fc6_2(x)
-        landmark = self.fc6_3(x)
-
-        return cls, bbox, landmark
-
-
-# 数据预处理和增强
 class CelebADataset(Dataset):
-    def __init__(self, root_dir, attr_file, bbox_file, landmark_file, net_type='PNet', transform=None):
+
+    def __init__(self, root_dir, anno_file, transform=None, max_samples=1000):
         self.root_dir = root_dir
-        self.net_type = net_type
         self.transform = transform
+        self.max_samples = max_samples
 
-        # 读取CelebA标注文件
-        self.attr_df = pd.read_csv(attr_file, delim_whitespace=True, header=1)
-        self.bbox_df = pd.read_csv(bbox_file, delim_whitespace=True, header=1)
-        self.landmark_df = pd.read_csv(landmark_file, delim_whitespace=True, header=1)
+        # 加载注释文件
+        self.annotations = self.load_annotations(anno_file)
 
-        # 根据网络类型设置输入尺寸
-        if net_type == 'PNet':
-            self.size = 12
-        elif net_type == 'RNet':
-            self.size = 24
-        elif net_type == 'ONet':
-            self.size = 48
+        # 限制样本数量
+        if len(self.annotations) > max_samples:
+            self.annotations = self.annotations[:max_samples]
 
-        self.image_names = list(self.attr_df.index)
+    def load_annotations(self, anno_file):
+        """加载CelebA人脸边界框注释"""
+        annotations = []
+
+        # 如果注释文件存在，直接加载
+        if os.path.exists(anno_file):
+            with open(anno_file, 'r') as f:
+                annotations = json.load(f)
+        else:
+            # 生成伪注释（实际使用时需要真实的标注数据）
+            img_dir = os.path.join(self.root_dir, 'img_align_celeba')
+            if os.path.exists(img_dir):
+                img_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')][:self.max_samples]
+
+                for img_file in img_files:
+                    # 为演示目的生成伪边界框（实际训练需要真实标注）
+                    img_path = os.path.join(img_dir, img_file)
+                    try:
+                        img = Image.open(img_path)
+                        w, h = img.size
+
+                        # 生成中心区域的伪人脸框
+                        x1 = w * 0.2
+                        y1 = h * 0.2
+                        x2 = w * 0.8
+                        y2 = h * 0.8
+
+                        annotations.append({
+                            'filename': img_file,
+                            'bbox': [x1, y1, x2, y2],
+                            'landmarks': [
+                                w * 0.35, w * 0.65, w * 0.5, w * 0.35, w * 0.65,  # x坐标
+                                h * 0.4, h * 0.4, h * 0.55, h * 0.7, h * 0.7  # y坐标
+                            ]
+                        })
+                    except Exception as e:
+                        print(f"处理图片 {img_file} 时出错: {e}")
+                        continue
+
+                # 保存生成的注释
+                os.makedirs(os.path.dirname(anno_file), exist_ok=True)
+                with open(anno_file, 'w') as f:
+                    json.dump(annotations, f, indent=2)
+
+        return annotations
 
     def __len__(self):
-        return len(self.image_names)
-
-    def generate_sample(self, img, bbox, landmarks):
-        """生成正样本、负样本和部分样本"""
-        height, width = img.shape[:2]
-        x, y, w, h = bbox
-
-        samples = []
-        labels = []
-        bbox_targets = []
-        landmark_targets = []
-
-        # 生成正样本 (IoU > 0.65)
-        for _ in range(10):
-            # 随机偏移
-            dx = np.random.uniform(-0.2, 0.2) * w
-            dy = np.random.uniform(-0.2, 0.2) * h
-            dw = np.random.uniform(-0.2, 0.2) * w
-            dh = np.random.uniform(-0.2, 0.2) * h
-
-            nx = max(0, x + dx)
-            ny = max(0, y + dy)
-            nw = min(width - nx, w + dw)
-            nh = min(height - ny, h + dh)
-
-            if nw > 0 and nh > 0:
-                # 计算IoU
-                iou = self.calculate_iou([x, y, w, h], [nx, ny, nw, nh])
-                if iou > 0.65:
-                    crop = img[int(ny):int(ny + nh), int(nx):int(nx + nw)]
-                    crop = cv2.resize(crop, (self.size, self.size))
-
-                    # 计算相对偏移
-                    offset_x = (x - nx) / nw
-                    offset_y = (y - ny) / nh
-                    offset_w = w / nw
-                    offset_h = h / nh
-
-                    samples.append(crop)
-                    labels.append(1)  # 正样本
-                    bbox_targets.append([offset_x, offset_y, offset_w, offset_h])
-                    landmark_targets.append(self.transform_landmarks(landmarks, nx, ny, nw, nh))
-
-        # 生成负样本 (IoU < 0.3)
-        for _ in range(20):
-            size = np.random.uniform(0.3, 1.0) * min(width, height)
-            nx = np.random.uniform(0, width - size)
-            ny = np.random.uniform(0, height - size)
-
-            iou = self.calculate_iou([x, y, w, h], [nx, ny, size, size])
-            if iou < 0.3:
-                crop = img[int(ny):int(ny + size), int(nx):int(nx + size)]
-                crop = cv2.resize(crop, (self.size, self.size))
-
-                samples.append(crop)
-                labels.append(0)  # 负样本
-                bbox_targets.append([0, 0, 0, 0])
-                landmark_targets.append([0] * 10)
-
-        # 生成部分样本 (0.4 < IoU < 0.65)
-        for _ in range(5):
-            dx = np.random.uniform(-0.5, 0.5) * w
-            dy = np.random.uniform(-0.5, 0.5) * h
-            dw = np.random.uniform(-0.3, 0.3) * w
-            dh = np.random.uniform(-0.3, 0.3) * h
-
-            nx = max(0, x + dx)
-            ny = max(0, y + dy)
-            nw = min(width - nx, w + dw)
-            nh = min(height - ny, h + dh)
-
-            if nw > 0 and nh > 0:
-                iou = self.calculate_iou([x, y, w, h], [nx, ny, nw, nh])
-                if 0.4 < iou < 0.65:
-                    crop = img[int(ny):int(ny + nh), int(nx):int(nx + nw)]
-                    crop = cv2.resize(crop, (self.size, self.size))
-
-                    offset_x = (x - nx) / nw
-                    offset_y = (y - ny) / nh
-                    offset_w = w / nw
-                    offset_h = h / nh
-
-                    samples.append(crop)
-                    labels.append(-1)  # 部分样本
-                    bbox_targets.append([offset_x, offset_y, offset_w, offset_h])
-                    landmark_targets.append(self.transform_landmarks(landmarks, nx, ny, nw, nh))
-
-        return samples, labels, bbox_targets, landmark_targets
-
-    def calculate_iou(self, box1, box2):
-        """计算两个边界框的IoU"""
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-
-        # 计算交集
-        xi1 = max(x1, x2)
-        yi1 = max(y1, y2)
-        xi2 = min(x1 + w1, x2 + w2)
-        yi2 = min(y1 + h1, y2 + h2)
-
-        if xi2 <= xi1 or yi2 <= yi1:
-            return 0
-
-        inter_area = (xi2 - xi1) * (yi2 - yi1)
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - inter_area
-
-        return inter_area / union_area
-
-    def transform_landmarks(self, landmarks, x, y, w, h):
-        """将关键点坐标转换为相对坐标"""
-        transformed = []
-        for i in range(0, len(landmarks), 2):
-            lx = (landmarks[i] - x) / w
-            ly = (landmarks[i + 1] - y) / h
-            transformed.extend([lx, ly])
-        return transformed
+        return len(self.annotations)
 
     def __getitem__(self, idx):
-        img_name = self.image_names[idx]
-        img_path = os.path.join(self.root_dir, 'img_align_celeba', img_name)
+        annotation = self.annotations[idx]
+        img_path = os.path.join(self.root_dir, 'img_align_celeba', annotation['filename'])
 
-        # 读取图像
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # 加载图片
+        image = Image.open(img_path).convert('RGB')
+        bbox = annotation['bbox']
+        landmarks = annotation['landmarks']
 
-        # 获取边界框和关键点
-        bbox_row = self.bbox_df.loc[img_name]
-        bbox = [bbox_row['x_1'], bbox_row['y_1'], bbox_row['width'], bbox_row['height']]
+        # 应用数据增强
+        if self.transform:
+            image, bbox, landmarks = self.transform(image, bbox, landmarks)
 
-        landmark_row = self.landmark_df.loc[img_name]
-        landmarks = [landmark_row[f'lefteye_x'], landmark_row[f'lefteye_y'],
-                     landmark_row[f'righteye_x'], landmark_row[f'righteye_y'],
-                     landmark_row[f'nose_x'], landmark_row[f'nose_y'],
-                     landmark_row[f'leftmouth_x'], landmark_row[f'leftmouth_y'],
-                     landmark_row[f'rightmouth_x'], landmark_row[f'rightmouth_y']]
-
-        # 生成训练样本
-        samples, labels, bbox_targets, landmark_targets = self.generate_sample(img, bbox, landmarks)
-
-        # 随机选择一个样本
-        if samples:
-            idx = np.random.randint(len(samples))
-            sample = samples[idx]
-            label = labels[idx]
-            bbox_target = bbox_targets[idx]
-            landmark_target = landmark_targets[idx]
-
-            if self.transform:
-                sample = self.transform(sample)
-            else:
-                sample = torch.FloatTensor(sample).permute(2, 0, 1) / 255.0
-
-            return {
-                'image': sample,
-                'label': torch.FloatTensor([label]),
-                'bbox': torch.FloatTensor(bbox_target),
-                'landmark': torch.FloatTensor(landmark_target)
-            }
-        else:
-            # 如果没有生成有效样本，返回原始裁剪
-            x, y, w, h = bbox
-            crop = img[int(y):int(y + h), int(x):int(x + w)]
-            crop = cv2.resize(crop, (self.size, self.size))
-
-            if self.transform:
-                crop = self.transform(crop)
-            else:
-                crop = torch.FloatTensor(crop).permute(2, 0, 1) / 255.0
-
-            return {
-                'image': crop,
-                'label': torch.FloatTensor([1]),
-                'bbox': torch.FloatTensor([0, 0, 1, 1]),
-                'landmark': torch.FloatTensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
-            }
+        return image, bbox, landmarks, annotation['filename']
 
 
-# 损失函数
-class MTCNNLoss(nn.Module):
-    def __init__(self):
-        super(MTCNNLoss, self).__init__()
-        self.cls_loss = nn.BCELoss()
-        self.bbox_loss = nn.MSELoss()
-        self.landmark_loss = nn.MSELoss()
+class DataAugmentation:
+    """数据增强类"""
 
-    def forward(self, cls_pred, bbox_pred, landmark_pred, cls_target, bbox_target, landmark_target):
-        # 分类损失
-        cls_mask = (cls_target >= 0).float()  # 忽略部分样本的分类损失
-        cls_loss = self.cls_loss(cls_pred.squeeze() * cls_mask, cls_target.squeeze() * cls_mask)
+    def __init__(self, rotation_range=10, flip_prob=0.5, color_enhance_prob=0.3):
+        self.rotation_range = rotation_range
+        self.flip_prob = flip_prob
+        self.color_enhance_prob = color_enhance_prob
 
-        # 边界框回归损失 (只对正样本和部分样本计算)
-        bbox_mask = (cls_target != 0).float().unsqueeze(1)
-        bbox_loss = self.bbox_loss(bbox_pred * bbox_mask, bbox_target * bbox_mask)
+    def __call__(self, image, bbox, landmarks):
+        # 随机小角度旋转
+        if random.random() < 0.5:
+            angle = random.uniform(-self.rotation_range, self.rotation_range)
+            image = image.rotate(angle, expand=False)
 
-        # 关键点回归损失 (只对正样本计算)
-        landmark_mask = (cls_target == 1).float().unsqueeze(1)
-        landmark_loss = self.landmark_loss(landmark_pred * landmark_mask, landmark_target * landmark_mask)
+        # 随机水平翻转
+        if random.random() < self.flip_prob:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            w = image.size[0]
+            # 调整边界框
+            bbox[0], bbox[2] = w - bbox[2], w - bbox[0]
+            # 调整关键点
+            landmarks[0], landmarks[1], landmarks[3], landmarks[4] = \
+                w - landmarks[1], w - landmarks[0], w - landmarks[4], w - landmarks[3]
 
-        total_loss = cls_loss + 0.5 * bbox_loss + 0.5 * landmark_loss
+        # 随机颜色增强
+        if random.random() < self.color_enhance_prob:
+            # 亮度调整
+            enhancer = ImageEnhance.Brightness(image)
+            image = enhancer.enhance(random.uniform(0.8, 1.2))
 
-        return total_loss, cls_loss, bbox_loss, landmark_loss
+            # 对比度调整
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(random.uniform(0.8, 1.2))
+
+            # 饱和度调整
+            enhancer = ImageEnhance.Color(image)
+            image = enhancer.enhance(random.uniform(0.8, 1.2))
+
+        return image, bbox, landmarks
 
 
-# 训练函数
 class MTCNNTrainer:
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
+    """MTCNN训练器"""
 
-        # 数据变换
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-            transforms.ToTensor(),
-        ])
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        self.pnet = PNet().to(device)
+        self.rnet = RNet().to(device)
+        self.onet = ONet().to(device)
 
-    def train_network(self, net_type='PNet', epochs=50, batch_size=32, lr=0.001):
-        """训练指定的网络"""
-        print(f"Training {net_type}...")
+        # 损失函数
+        self.cls_loss_fn = nn.CrossEntropyLoss(reduction='none')
+        self.bbox_loss_fn = nn.MSELoss(reduction='none')
+        self.landmark_loss_fn = nn.MSELoss(reduction='none')
 
-        # 创建网络
-        if net_type == 'PNet':
-            model = PNet()
-        elif net_type == 'RNet':
-            model = RNet()
-        elif net_type == 'ONet':
-            model = ONet()
+        # 优化器
+        self.pnet_optimizer = optim.Adam(self.pnet.parameters(), lr=0.001)
+        self.rnet_optimizer = optim.Adam(self.rnet.parameters(), lr=0.001)
+        self.onet_optimizer = optim.Adam(self.onet.parameters(), lr=0.001)
 
-        model = model.to(self.device)
+        # 学习率调度器
+        self.pnet_scheduler = optim.lr_scheduler.StepLR(self.pnet_optimizer, step_size=10, gamma=0.5)
+        self.rnet_scheduler = optim.lr_scheduler.StepLR(self.rnet_optimizer, step_size=10, gamma=0.5)
+        self.onet_scheduler = optim.lr_scheduler.StepLR(self.onet_optimizer, step_size=10, gamma=0.5)
 
-        # 创建数据集和数据加载器
-        dataset = CelebADataset(
-            root_dir=self.data_dir,
-            attr_file=os.path.join(self.data_dir, 'list_attr_celeba.txt'),
-            bbox_file=os.path.join(self.data_dir, 'list_bbox_celeba.txt'),
-            landmark_file=os.path.join(self.data_dir, 'list_landmarks_align_celeba.txt'),
-            net_type=net_type,
-            transform=self.transform
-        )
+    def generate_training_data(self, dataloader, stage='pnet'):
+        """为不同网络阶段生成训练数据"""
+        positive_samples = []
+        negative_samples = []
+        part_samples = []
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        for batch_idx, (images, bboxes, landmarks, filenames) in enumerate(
+                tqdm(dataloader, desc=f"生成{stage}训练数据")):
+            for i in range(len(images)):
+                image = images[i]
+                bbox = bboxes[i]
+                landmark = landmarks[i]
 
-        # 优化器和损失函数
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = MTCNNLoss()
+                # 生成正样本、负样本和部分样本
+                pos_samples, neg_samples, part_samples_batch = self._generate_samples_for_image(
+                    image, bbox, landmark, stage)
 
-        # 训练循环
-        model.train()
+                positive_samples.extend(pos_samples)
+                negative_samples.extend(neg_samples)
+                part_samples.extend(part_samples_batch)
+
+        return positive_samples, negative_samples, part_samples
+
+    def _generate_samples_for_image(self, image, bbox, landmark, stage):
+        """为单张图片生成训练样本"""
+        pos_samples = []
+        neg_samples = []
+        part_samples = []
+
+        w, h = image.size
+
+        # 根据不同阶段设置样本大小
+        if stage == 'pnet':
+            sample_size = 12
+        elif stage == 'rnet':
+            sample_size = 24
+        else:  # onet
+            sample_size = 48
+
+        # 生成正样本 (IoU > 0.65)
+        for _ in range(20):  # 每张图片生成20个正样本
+            # 在真实边界框附近采样
+            noise_x = random.uniform(-0.1, 0.1) * (bbox[2] - bbox[0])
+            noise_y = random.uniform(-0.1, 0.1) * (bbox[3] - bbox[1])
+            noise_w = random.uniform(-0.1, 0.1) * (bbox[2] - bbox[0])
+            noise_h = random.uniform(-0.1, 0.1) * (bbox[3] - bbox[1])
+
+            sample_x1 = max(0, bbox[0] + noise_x)
+            sample_y1 = max(0, bbox[1] + noise_y)
+            sample_x2 = min(w, bbox[2] + noise_w)
+            sample_y2 = min(h, bbox[3] + noise_h)
+
+            if self._calculate_iou([sample_x1, sample_y1, sample_x2, sample_y2], bbox) > 0.65:
+                crop_img = image.crop((sample_x1, sample_y1, sample_x2, sample_y2))
+                crop_img = crop_img.resize((sample_size, sample_size), Image.BILINEAR)
+                pos_samples.append((crop_img, 1, [sample_x1, sample_y1, sample_x2, sample_y2], landmark))
+
+        # 生成负样本 (IoU < 0.3)
+        for _ in range(50):  # 每张图片生成50个负样本
+            sample_x1 = random.uniform(0, w - sample_size)
+            sample_y1 = random.uniform(0, h - sample_size)
+            sample_x2 = sample_x1 + random.uniform(sample_size, min(w - sample_x1, sample_size * 2))
+            sample_y2 = sample_y1 + random.uniform(sample_size, min(h - sample_y1, sample_size * 2))
+
+            if self._calculate_iou([sample_x1, sample_y1, sample_x2, sample_y2], bbox) < 0.3:
+                crop_img = image.crop((sample_x1, sample_y1, sample_x2, sample_y2))
+                crop_img = crop_img.resize((sample_size, sample_size), Image.BILINEAR)
+                neg_samples.append((crop_img, 0, [sample_x1, sample_y1, sample_x2, sample_y2], landmark))
+
+        # 生成部分样本 (0.4 < IoU < 0.65)
+        for _ in range(20):  # 每张图片生成20个部分样本
+            noise_x = random.uniform(-0.3, 0.3) * (bbox[2] - bbox[0])
+            noise_y = random.uniform(-0.3, 0.3) * (bbox[3] - bbox[1])
+
+            sample_x1 = max(0, bbox[0] + noise_x)
+            sample_y1 = max(0, bbox[1] + noise_y)
+            sample_x2 = min(w, bbox[2] + noise_x)
+            sample_y2 = min(h, bbox[3] + noise_y)
+
+            iou = self._calculate_iou([sample_x1, sample_y1, sample_x2, sample_y2], bbox)
+            if 0.4 < iou < 0.65:
+                crop_img = image.crop((sample_x1, sample_y1, sample_x2, sample_y2))
+                crop_img = crop_img.resize((sample_size, sample_size), Image.BILINEAR)
+                part_samples.append((crop_img, -1, [sample_x1, sample_y1, sample_x2, sample_y2], landmark))
+
+        return pos_samples, neg_samples, part_samples
+
+    def _calculate_iou(self, box1, box2):
+        """计算两个边界框的IoU"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def online_hard_example_mining(self, losses, ratio=0.7):
+        """在线难例挖掘：选择前70%的高损失样本"""
+        num_samples = len(losses)
+        num_hard = int(num_samples * ratio)
+
+        # 获取损失值最高的样本索引
+        sorted_indices = torch.argsort(losses, descending=True)
+        hard_indices = sorted_indices[:num_hard]
+
+        return hard_indices
+
+    def train_pnet(self, train_dataloader, val_dataloader, epochs=20):
+        """训练P-Net"""
+        print("开始训练P-Net...")
+        best_val_loss = float('inf')
+        best_pnet_state = None
+
+        train_losses = []
+        val_losses = []
+
         for epoch in range(epochs):
-            total_loss = 0
-            cls_loss_sum = 0
-            bbox_loss_sum = 0
-            landmark_loss_sum = 0
+            self.pnet.train()
+            total_loss = 0.0
+            num_batches = 0
 
-            pbar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{epochs}')
-            for batch_idx, batch in enumerate(pbar):
-                images = batch['image'].to(self.device)
-                cls_labels = batch['label'].to(self.device)
-                bbox_labels = batch['bbox'].to(self.device)
-                landmark_labels = batch['landmark'].to(self.device)
+            # 生成训练数据
+            pos_samples, neg_samples, part_samples = self.generate_training_data(train_dataloader, 'pnet')
+            all_samples = pos_samples + neg_samples + part_samples
+            random.shuffle(all_samples)
 
-                optimizer.zero_grad()
+            # 批处理训练
+            batch_size = 128
+            for i in tqdm(range(0, len(all_samples), batch_size), desc=f"P-Net Epoch {epoch + 1}"):
+                batch_samples = all_samples[i:i + batch_size]
+
+                # 准备批数据
+                images = []
+                labels = []
+                bboxes = []
+
+                for sample in batch_samples:
+                    img, label, bbox, _ = sample
+                    img_array = np.array(img).astype(np.float32)
+                    img_array = (img_array - 127.5) * 0.0078125
+                    img_array = np.transpose(img_array, (2, 0, 1))
+                    images.append(img_array)
+                    labels.append(1 if label == 1 else 0)  # 二分类：人脸/非人脸
+                    bboxes.append(bbox)
+
+                images = torch.FloatTensor(images).to(self.device)
+                labels = torch.LongTensor(labels).to(self.device)
 
                 # 前向传播
-                cls_pred, bbox_pred, landmark_pred = model(images)
+                bbox_pred, cls_pred = self.pnet(images)
 
                 # 计算损失
-                loss, cls_loss, bbox_loss, landmark_loss = criterion(
-                    cls_pred, bbox_pred, landmark_pred,
-                    cls_labels, bbox_labels, landmark_labels
-                )
+                cls_loss = self.cls_loss_fn(cls_pred.view(-1, 2), labels)
+
+                # 在线难例挖掘
+                hard_indices = self.online_hard_example_mining(cls_loss)
+                cls_loss = cls_loss[hard_indices].mean()
 
                 # 反向传播
-                loss.backward()
-                optimizer.step()
+                self.pnet_optimizer.zero_grad()
+                cls_loss.backward()
+                self.pnet_optimizer.step()
 
-                total_loss += loss.item()
-                cls_loss_sum += cls_loss.item()
-                bbox_loss_sum += bbox_loss.item()
-                landmark_loss_sum += landmark_loss.item()
+                total_loss += cls_loss.item()
+                num_batches += 1
 
-                pbar.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Cls': f'{cls_loss.item():.4f}',
-                    'Box': f'{bbox_loss.item():.4f}',
-                    'Landmark': f'{landmark_loss.item():.4f}'
-                })
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            print(f"P-Net Epoch {epoch + 1}/{epochs}, Training Average Loss: {avg_loss:.4f}")
+            train_losses.append(avg_loss)
 
-            avg_loss = total_loss / len(dataloader)
-            avg_cls_loss = cls_loss_sum / len(dataloader)
-            avg_bbox_loss = bbox_loss_sum / len(dataloader)
-            avg_landmark_loss = landmark_loss_sum / len(dataloader)
+            # 验证集评估
+            self.pnet.eval()
+            val_total_loss = 0.0
+            val_num_batches = 0
+            with torch.no_grad():
+                pos_samples, neg_samples, part_samples = self.generate_training_data(val_dataloader, 'pnet')
+                all_samples = pos_samples + neg_samples + part_samples
+                random.shuffle(all_samples)
+                for i in range(0, len(all_samples), batch_size):
+                    batch_samples = all_samples[i:i + batch_size]
+                    images = []
+                    labels = []
+                    for sample in batch_samples:
+                        img, label, _, _ = sample
+                        img_array = np.array(img).astype(np.float32)
+                        img_array = (img_array - 127.5) * 0.0078125
+                        img_array = np.transpose(img_array, (2, 0, 1))
+                        images.append(img_array)
+                        labels.append(1 if label == 1 else 0)
+                    images = torch.FloatTensor(images).to(self.device)
+                    labels = torch.LongTensor(labels).to(self.device)
+                    bbox_pred, cls_pred = self.pnet(images)
+                    cls_loss = self.cls_loss_fn(cls_pred.view(-1, 2), labels)
+                    hard_indices = self.online_hard_example_mining(cls_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    val_total_loss += cls_loss.item()
+                    val_num_batches += 1
+            avg_val_loss = val_total_loss / val_num_batches if val_num_batches > 0 else 0
+            print(f"P-Net Epoch {epoch + 1}/{epochs}, Validation Average Loss: {avg_val_loss:.4f}")
+            val_losses.append(avg_val_loss)
 
-            print(f'Epoch {epoch + 1}: Loss={avg_loss:.4f}, Cls={avg_cls_loss:.4f}, '
-                  f'Box={avg_bbox_loss:.4f}, Landmark={avg_landmark_loss:.4f}')
+            # 保存最佳模型
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_pnet_state = self.pnet.state_dict()
 
-            # 保存模型
-            if (epoch + 1) % 10 == 0:
-                torch.save(model.state_dict(), f'{net_type}_epoch_{epoch + 1}.pth')
+            self.pnet_scheduler.step()
 
-        # 保存最终模型
-        torch.save(model.state_dict(), f'{net_type}_final.pth')
-        print(f"{net_type} training completed!")
+        # 加载最佳模型
+        self.pnet.load_state_dict(best_pnet_state)
+        # 保存模型
+        torch.save(self.pnet.state_dict(), 'pnet_trained.pth')
+        print("P-Net训练完成并保存")
 
-        return model
+        # 绘制损失曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='训练损失')
+        plt.plot(val_losses, label='验证损失')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Model Loss')
+        plt.legend()
+        plt.show()
 
-    def train_cascade(self):
-        """级联训练所有网络"""
-        print("Starting MTCNN cascade training...")
+    def train_rnet(self, train_dataloader, val_dataloader, epochs=20):
+        """训练R-Net"""
+        print("开始训练R-Net...")
+        best_val_loss = float('inf')
+        best_rnet_state = None
 
-        # 训练P-Net
-        pnet = self.train_network('PNet', epochs=30, batch_size=64, lr=0.001)
+        train_losses = []
+        val_losses = []
 
-        # 训练R-Net
-        rnet = self.train_network('RNet', epochs=40, batch_size=32, lr=0.0005)
+        for epoch in range(epochs):
+            self.rnet.train()
+            total_loss = 0.0
+            num_batches = 0
 
-        # 训练O-Net
-        onet = self.train_network('ONet', epochs=50, batch_size=16, lr=0.0001)
+            # 生成训练数据
+            pos_samples, neg_samples, part_samples = self.generate_training_data(train_dataloader, 'rnet')
+            all_samples = pos_samples + neg_samples + part_samples
+            random.shuffle(all_samples)
 
-        print("MTCNN cascade training completed!")
-        return pnet, rnet, onet
+            # 批处理训练
+            batch_size = 128
+            for i in tqdm(range(0, len(all_samples), batch_size), desc=f"R-Net Epoch {epoch + 1}"):
+                batch_samples = all_samples[i:i + batch_size]
+
+                # 准备批数据
+                images = []
+                labels = []
+
+                for sample in batch_samples:
+                    img, label, _, _ = sample
+                    img_array = np.array(img).astype(np.float32)
+                    img_array = (img_array - 127.5) * 0.0078125
+                    img_array = np.transpose(img_array, (2, 0, 1))
+                    images.append(img_array)
+                    labels.append(1 if label == 1 else 0)
+
+                images = torch.FloatTensor(images).to(self.device)
+                labels = torch.LongTensor(labels).to(self.device)
+
+                # 前向传播
+                bbox_pred, cls_pred = self.rnet(images)
+
+                # 计算损失
+                cls_loss = self.cls_loss_fn(cls_pred, labels)
+
+                # 在线难例挖掘
+                hard_indices = self.online_hard_example_mining(cls_loss)
+                cls_loss = cls_loss[hard_indices].mean()
+
+                # 反向传播
+                self.rnet_optimizer.zero_grad()
+                cls_loss.backward()
+                self.rnet_optimizer.step()
+
+                total_loss += cls_loss.item()
+                num_batches += 1
+
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            print(f"R-Net Epoch {epoch + 1}/{epochs}, Training Average Loss: {avg_loss:.4f}")
+            train_losses.append(avg_loss)
+
+            # 验证集评估
+            self.rnet.eval()
+            val_total_loss = 0.0
+            val_num_batches = 0
+            with torch.no_grad():
+                pos_samples, neg_samples, part_samples = self.generate_training_data(val_dataloader, 'rnet')
+                all_samples = pos_samples + neg_samples + part_samples
+                random.shuffle(all_samples)
+                for i in range(0, len(all_samples), batch_size):
+                    batch_samples = all_samples[i:i + batch_size]
+                    images = []
+                    labels = []
+                    for sample in batch_samples:
+                        img, label, _, _ = sample
+                        img_array = np.array(img).astype(np.float32)
+                        img_array = (img_array - 127.5) * 0.0078125
+                        img_array = np.transpose(img_array, (2, 0, 1))
+                        images.append(img_array)
+                        labels.append(1 if label == 1 else 0)
+                    images = torch.FloatTensor(images).to(self.device)
+                    labels = torch.LongTensor(labels).to(self.device)
+                    bbox_pred, cls_pred = self.rnet(images)
+                    cls_loss = self.cls_loss_fn(cls_pred, labels)
+                    hard_indices = self.online_hard_example_mining(cls_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    val_total_loss += cls_loss.item()
+                    val_num_batches += 1
+            avg_val_loss = val_total_loss / val_num_batches if val_num_batches > 0 else 0
+            print(f"R-Net Epoch {epoch + 1}/{epochs}, Validation Average Loss: {avg_val_loss:.4f}")
+            val_losses.append(avg_val_loss)
+
+            # 保存最佳模型
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_rnet_state = self.rnet.state_dict()
+
+            self.rnet_scheduler.step()
+
+        # 加载最佳模型
+        self.rnet.load_state_dict(best_rnet_state)
+        # 保存模型
+        torch.save(self.rnet.state_dict(), 'rnet_trained.pth')
+        print("R-Net训练完成并保存")
+
+        # 绘制损失曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='训练损失')
+        plt.plot(val_losses, label='验证损失')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Model Loss')
+        plt.legend()
+        plt.show()
+
+    def train_onet(self, train_dataloader, val_dataloader, epochs=20):
+        """训练O-Net"""
+        print("开始训练O-Net...")
+        best_val_loss = float('inf')
+        best_onet_state = None
+
+        train_losses = []
+        val_losses = []
+
+        for epoch in range(epochs):
+            self.onet.train()
+            total_cls_loss = 0.0
+            total_bbox_loss = 0.0
+            total_landmark_loss = 0.0
+            num_batches = 0
+
+            # 生成训练数据
+            pos_samples, neg_samples, part_samples = self.generate_training_data(train_dataloader, 'onet')
+            all_samples = pos_samples + neg_samples + part_samples
+            random.shuffle(all_samples)
+
+            # 批处理训练
+            batch_size = 64
+            for i in tqdm(range(0, len(all_samples), batch_size), desc=f"O-Net Epoch {epoch + 1}"):
+                batch_samples = all_samples[i:i + batch_size]
+
+                # 准备批数据
+                images = []
+                labels = []
+                bboxes = []
+                landmarks = []
+
+                for sample in batch_samples:
+                    img, label, bbox, landmark = sample
+                    img_array = np.array(img).astype(np.float32)
+                    img_array = (img_array - 127.5) * 0.0078125
+                    img_array = np.transpose(img_array, (2, 0, 1))
+                    images.append(img_array)
+                    labels.append(1 if label == 1 else 0)
+                    bboxes.append(bbox)
+                    landmarks.append(landmark)
+
+                images = torch.FloatTensor(images).to(self.device)
+                labels = torch.LongTensor(labels).to(self.device)
+                bboxes = torch.FloatTensor(bboxes).to(self.device)
+                landmarks = torch.FloatTensor(landmarks).to(self.device)
+
+                # 前向传播
+                landmark_pred, bbox_pred, cls_pred = self.onet(images)
+
+                # 计算损失
+                cls_loss = self.cls_loss_fn(cls_pred, labels)
+                bbox_loss = self.bbox_loss_fn(bbox_pred, bboxes).mean(dim=1)
+                landmark_loss = self.landmark_loss_fn(landmark_pred, landmarks).mean(dim=1)
+
+                # 总损失
+                total_loss = cls_loss + bbox_loss + landmark_loss
+
+                # 在线难例挖掘
+                hard_indices = self.online_hard_example_mining(total_loss)
+                cls_loss = cls_loss[hard_indices].mean()
+                bbox_loss = bbox_loss[hard_indices].mean()
+                landmark_loss = landmark_loss[hard_indices].mean()
+
+                final_loss = cls_loss + bbox_loss + landmark_loss
+
+                # 反向传播
+                self.onet_optimizer.zero_grad()
+                final_loss.backward()
+                self.onet_optimizer.step()
+
+                total_cls_loss += cls_loss.item()
+                total_bbox_loss += bbox_loss.item()
+                total_landmark_loss += landmark_loss.item()
+                num_batches += 1
+
+            avg_cls_loss = total_cls_loss / num_batches if num_batches > 0 else 0
+            avg_bbox_loss = total_bbox_loss / num_batches if num_batches > 0 else 0
+            avg_landmark_loss = total_landmark_loss / num_batches if num_batches > 0 else 0
+
+            total_train_loss = avg_cls_loss + avg_bbox_loss + avg_landmark_loss
+            print(f"O-Net Epoch {epoch + 1}/{epochs}")
+            print(f"  Training Cls Loss: {avg_cls_loss:.4f}")
+            print(f"  Training BBox Loss: {avg_bbox_loss:.4f}")
+            print(f"  Training Landmark Loss: {avg_landmark_loss:.4f}")
+            train_losses.append(total_train_loss)
+
+            # 验证集评估
+            self.onet.eval()
+            val_total_cls_loss = 0.0
+            val_total_bbox_loss = 0.0
+            val_total_landmark_loss = 0.0
+            val_num_batches = 0
+            with torch.no_grad():
+                pos_samples, neg_samples, part_samples = self.generate_training_data(val_dataloader, 'onet')
+                all_samples = pos_samples + neg_samples + part_samples
+                random.shuffle(all_samples)
+                for i in range(0, len(all_samples), batch_size):
+                    batch_samples = all_samples[i:i + batch_size]
+                    images = []
+                    labels = []
+                    bboxes = []
+                    landmarks = []
+                    for sample in batch_samples:
+                        img, label, bbox, landmark = sample
+                        img_array = np.array(img).astype(np.float32)
+                        img_array = (img_array - 127.5) * 0.0078125
+                        img_array = np.transpose(img_array, (2, 0, 1))
+                        images.append(img_array)
+                        labels.append(1 if label == 1 else 0)
+                        bboxes.append(bbox)
+                        landmarks.append(landmark)
+                    images = torch.FloatTensor(images).to(self.device)
+                    labels = torch.LongTensor(labels).to(self.device)
+                    bboxes = torch.FloatTensor(bboxes).to(self.device)
+                    landmarks = torch.FloatTensor(landmarks).to(self.device)
+                    landmark_pred, bbox_pred, cls_pred = self.onet(images)
+                    cls_loss = self.cls_loss_fn(cls_pred, labels)
+                    bbox_loss = self.bbox_loss_fn(bbox_pred, bboxes).mean(dim=1)
+                    landmark_loss = self.landmark_loss_fn(landmark_pred, landmarks).mean(dim=1)
+                    total_loss = cls_loss + bbox_loss + landmark_loss
+                    hard_indices = self.online_hard_example_mining(total_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    bbox_loss = bbox_loss[hard_indices].mean()
+                    landmark_loss = landmark_loss[hard_indices].mean()
+                    val_total_cls_loss += cls_loss.item()
+                    val_total_bbox_loss += bbox_loss.item()
+                    val_total_landmark_loss += landmark_loss.item()
+                    val_num_batches += 1
+            avg_val_cls_loss = val_total_cls_loss / val_num_batches if val_num_batches > 0 else 0
+            avg_val_bbox_loss = val_total_bbox_loss / val_num_batches if val_num_batches > 0 else 0
+            avg_val_landmark_loss = val_total_landmark_loss / val_num_batches if val_num_batches > 0 else 0
+
+            total_val_loss = avg_val_cls_loss + avg_val_bbox_loss + avg_val_landmark_loss
+            print(f"O-Net Epoch {epoch + 1}/{epochs}")
+            print(f"  Validation Cls Loss: {avg_val_cls_loss:.4f}")
+            print(f"  Validation BBox Loss: {avg_val_bbox_loss:.4f}")
+            print(f"  Validation Landmark Loss: {avg_val_landmark_loss:.4f}")
+            val_losses.append(total_val_loss)
+
+            # 保存最佳模型
+            if total_val_loss < best_val_loss:
+                best_val_loss = total_val_loss
+                best_onet_state = self.onet.state_dict()
+
+            self.onet_scheduler.step()
+
+        # 加载最佳模型
+        self.onet.load_state_dict(best_onet_state)
+        # 保存模型
+        torch.save(self.onet.state_dict(), 'onet_trained.pth')
+        print("O-Net训练完成并保存")
+
+        # 绘制损失曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='训练损失')
+        plt.plot(val_losses, label='验证损失')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('O-Net Model Loss')
+        plt.legend()
+        plt.show()
+
+    def test_model(self, test_dataloader, stage='pnet'):
+        """测试模型"""
+        if stage == 'pnet':
+            model = self.pnet
+        elif stage == 'rnet':
+            model = self.rnet
+        else:
+            model = self.onet
+        model.eval()
+        total_cls_loss = 0.0
+        total_bbox_loss = 0.0
+        total_landmark_loss = 0.0
+        num_batches = 0
+        with torch.no_grad():
+            pos_samples, neg_samples, part_samples = self.generate_training_data(test_dataloader, stage)
+            all_samples = pos_samples + neg_samples + part_samples
+            random.shuffle(all_samples)
+            if stage == 'pnet' or stage == 'rnet':
+                batch_size = 128
+            else:
+                batch_size = 64
+            for i in range(0, len(all_samples), batch_size):
+                batch_samples = all_samples[i:i + batch_size]
+                images = []
+                labels = []
+                bboxes = []
+                landmarks = []
+                for sample in batch_samples:
+                    img, label, bbox, landmark = sample
+                    img_array = np.array(img).astype(np.float32)
+                    img_array = (img_array - 127.5) * 0.0078125
+                    img_array = np.transpose(img_array, (2, 0, 1))
+                    images.append(img_array)
+                    labels.append(1 if label == 1 else 0)
+                    bboxes.append(bbox)
+                    landmarks.append(landmark)
+                images = torch.FloatTensor(images).to(self.device)
+                labels = torch.LongTensor(labels).to(self.device)
+                bboxes = torch.FloatTensor(bboxes).to(self.device)
+                landmarks = torch.FloatTensor(landmarks).to(self.device)
+                if stage == 'pnet':
+                    bbox_pred, cls_pred = model(images)
+                    cls_loss = self.cls_loss_fn(cls_pred.view(-1, 2), labels)
+                    hard_indices = self.online_hard_example_mining(cls_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    total_cls_loss += cls_loss.item()
+                elif stage == 'rnet':
+                    bbox_pred, cls_pred = model(images)
+                    cls_loss = self.cls_loss_fn(cls_pred, labels)
+                    hard_indices = self.online_hard_example_mining(cls_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    total_cls_loss += cls_loss.item()
+                else:
+                    landmark_pred, bbox_pred, cls_pred = model(images)
+                    cls_loss = self.cls_loss_fn(cls_pred, labels)
+                    bbox_loss = self.bbox_loss_fn(bbox_pred, bboxes).mean(dim=1)
+                    landmark_loss = self.landmark_loss_fn(landmark_pred, landmarks).mean(dim=1)
+                    total_loss = cls_loss + bbox_loss + landmark_loss
+                    hard_indices = self.online_hard_example_mining(total_loss)
+                    cls_loss = cls_loss[hard_indices].mean()
+                    bbox_loss = bbox_loss[hard_indices].mean()
+                    landmark_loss = landmark_loss[hard_indices].mean()
+                    total_cls_loss += cls_loss.item()
+                    total_bbox_loss += bbox_loss.item()
+                    total_landmark_loss += landmark_loss.item()
+                num_batches += 1
+        if stage == 'pnet' or stage == 'rnet':
+            avg_cls_loss = total_cls_loss / num_batches if num_batches > 0 else 0
+            print(f"{stage.upper()}-Net Test Cls Loss: {avg_cls_loss:.4f}")
+        else:
+            avg_cls_loss = total_cls_loss / num_batches if num_batches > 0 else 0
+            avg_bbox_loss = total_bbox_loss / num_batches if num_batches > 0 else 0
+            avg_landmark_loss = total_landmark_loss / num_batches if num_batches > 0 else 0
+            print(f"O-Net Test Cls Loss: {avg_cls_loss:.4f}")
+            print(f"O-Net Test BBox Loss: {avg_bbox_loss:.4f}")
+            print(f"O-Net Test Landmark Loss: {avg_landmark_loss:.4f}")
 
 
-# 使用示例
-if __name__ == "__main__":
-    # CelebA数据集路径
-    data_dir = "/path/to/celeba"  # 请修改为您的CelebA数据集路径
+def main():
+    """主训练函数"""
+    # 设置数据路径
+    celeba_root = './celeba'  # CelebA数据集根目录
+    anno_file = './celeba/annotations.json'  # 注释文件路径
+
+    # 检查数据集是否存在
+    if not os.path.exists(celeba_root):
+        print(f"错误：CelebA数据集路径不存在: {celeba_root}")
+        print("请下载CelebA数据集并将其放置在正确的路径下")
+        return
+
+    # 创建数据增强
+    data_aug = DataAugmentation(rotation_range=10, flip_prob=0.5, color_enhance_prob=0.3)
+
+    # 创建数据集
+    dataset = CelebADataset(
+        root_dir=celeba_root,
+        anno_file=anno_file,
+        transform=data_aug,
+        max_samples=1000
+    )
+
+    # 划分数据集
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+    # 创建数据加载器
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+    print(f"训练集大小: {len(train_dataset)}")
+    print(f"验证集大小: {len(val_dataset)}")
+    print(f"测试集大小: {len(test_dataset)}")
 
     # 创建训练器
-    trainer = MTCNNTrainer(data_dir)
+    trainer = MTCNNTrainer()
 
-    # 开始训练
-    # 可以选择训练单个网络或整个级联
+    # 逐步训练各个网络
+    print("=" * 50)
+    trainer.train_pnet(train_dataloader, val_dataloader, epochs=15)
 
-    # 训练单个网络
-    # pnet = trainer.train_network('PNet', epochs=30)
+    print("=" * 50)
+    trainer.train_rnet(train_dataloader, val_dataloader, epochs=15)
 
-    # 或者训练整个级联
-    pnet, rnet, onet = trainer.train_cascade()
+    print("=" * 50)
+    trainer.train_onet(train_dataloader, val_dataloader, epochs=15)
+
+    # 测试模型
+    print("=" * 50)
+    print("开始测试模型...")
+    trainer.test_model(test_dataloader, stage='pnet')
+    trainer.test_model(test_dataloader, stage='rnet')
+    trainer.test_model(test_dataloader, stage='onet')
+
+    print("训练完成！模型已保存为：")
+    print("- pnet_trained.pth")
+    print("- rnet_trained.pth")
+    print("- onet_trained.pth")
+
+
+if __name__ == "__main__":
+    main()
